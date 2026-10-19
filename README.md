@@ -1,6 +1,6 @@
 # Gmail AI Executive Assistant
 
-A personal AI-powered Gmail assistant that reads and analyzes emails, generates summaries, identifies important notices, extracts deadlines, and manages notifications through a centralized web dashboard.
+büddy a personal AI-powered Gmail assistant that reads and analyzes emails, generates summaries, identifies important notices, extracts deadlines, and manages notifications through a centralized web dashboard.
 
 ## Tech Stack
 
