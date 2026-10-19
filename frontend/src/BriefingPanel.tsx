@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
@@ -18,12 +18,19 @@ type Briefing = {
   period_start?: string | null;
   period_end?: string | null;
   created_at?: string | null;
+  gmail_account_email?: string;
 };
 
-type LatestBriefingResponse = {
+type HistoryDay = {
+  date: string;
+  has_briefing: boolean;
   briefing: Briefing | null;
-  status?: "ok" | "empty";
-  message?: string;
+};
+
+type HistoryResponse = {
+  timezone: string;
+  today: string;
+  days: HistoryDay[];
 };
 
 function extractDetail(data: unknown): string | null {
@@ -33,43 +40,62 @@ function extractDetail(data: unknown): string | null {
   return null;
 }
 
+function formatDayLabel(isoDate: string): { weekday: string; day: string } {
+  const parsed = new Date(`${isoDate}T12:00:00`);
+  return {
+    weekday: parsed.toLocaleDateString(undefined, { weekday: "short" }),
+    day: parsed.toLocaleDateString(undefined, { day: "numeric" }),
+  };
+}
+
 export default function BriefingPanel() {
-  const [briefing, setBriefing] = useState<Briefing | null>(null);
-  const [emptyMessage, setEmptyMessage] = useState("");
+  const [days, setDays] = useState<HistoryDay[]>([]);
+  const [today, setToday] = useState("");
+  const [timezone, setTimezone] = useState("");
+  const [selectedDate, setSelectedDate] = useState("");
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState("");
 
-  const loadBriefing = useCallback(async () => {
+  const loadHistory = useCallback(async (preferDate?: string) => {
     try {
       setLoading(true);
       setError("");
 
-      const response = await fetch(`${API}/db/briefings/latest`);
+      const response = await fetch(`${API}/db/briefings/history`);
       const data = (await response.json().catch(() => null)) as
-        | LatestBriefingResponse
+        | HistoryResponse
         | { detail?: string }
         | null;
 
       if (!response.ok) {
+        const detail = extractDetail(data);
+        if (response.status === 404) {
+          throw new Error(
+            "Briefing history API not found. Restart the backend with: uvicorn main:app --reload --port 8000"
+          );
+        }
         throw new Error(
-          extractDetail(data) ||
-            `Failed to load briefing (${response.status})`
+          detail || `Failed to load briefing history (${response.status})`
         );
       }
 
-      const payload = data as LatestBriefingResponse | null;
-      const next = payload?.briefing ?? null;
-      setBriefing(next);
-      setEmptyMessage(
-        next
-          ? ""
-          : payload?.message ||
-              "No briefing has been generated yet."
-      );
+      const payload = data as HistoryResponse;
+      const nextDays = Array.isArray(payload.days) ? payload.days : [];
+      setDays(nextDays);
+      setToday(payload.today || "");
+      setTimezone(payload.timezone || "");
+
+      const preferred =
+        preferDate && nextDays.some((d) => d.date === preferDate)
+          ? preferDate
+          : payload.today && nextDays.some((d) => d.date === payload.today)
+            ? payload.today
+            : nextDays[nextDays.length - 1]?.date || "";
+
+      setSelectedDate(preferred);
     } catch (err) {
-      setBriefing(null);
-      setEmptyMessage("");
+      setDays([]);
       setError(err instanceof Error ? err.message : "Something went wrong");
     } finally {
       setLoading(false);
@@ -77,19 +103,27 @@ export default function BriefingPanel() {
   }, []);
 
   useEffect(() => {
-    void loadBriefing();
-  }, [loadBriefing]);
+    void loadHistory();
+  }, [loadHistory]);
 
   async function generateBriefing() {
     if (generating) return;
+
+    const dateForGenerate = selectedDate || today;
+    if (!dateForGenerate) {
+      setError("Select a date before generating a briefing.");
+      return;
+    }
 
     setGenerating(true);
     setError("");
 
     try {
-      const response = await fetch(`${API}/internal/briefing-now`, {
-        method: "POST",
-      });
+      const params = new URLSearchParams({ date: dateForGenerate });
+      const response = await fetch(
+        `${API}/internal/briefing-now?${params.toString()}`,
+        { method: "POST" }
+      );
       const data = await response.json().catch(() => null);
 
       if (!response.ok) {
@@ -99,7 +133,7 @@ export default function BriefingPanel() {
         );
       }
 
-      await loadBriefing();
+      await loadHistory(dateForGenerate);
     } catch (err) {
       setError(
         err instanceof Error ? err.message : "Briefing generation failed"
@@ -109,6 +143,12 @@ export default function BriefingPanel() {
     }
   }
 
+  const selectedDay = useMemo(
+    () => days.find((d) => d.date === selectedDate) ?? null,
+    [days, selectedDate]
+  );
+
+  const briefing = selectedDay?.briefing ?? null;
   const content = briefing?.content ?? {};
   const highlights = content.highlights ?? [];
   const deadlines = content.deadlines ?? [];
@@ -117,12 +157,17 @@ export default function BriefingPanel() {
   return (
     <section className="briefing-panel">
       <div className="briefing-header">
-        <h2>Daily briefing</h2>
+        <div>
+          <h2>Daily briefing</h2>
+          {timezone && (
+            <p className="briefing-timezone">Timezone: {timezone}</p>
+          )}
+        </div>
         <div className="briefing-actions">
           <button
             type="button"
             className="inbox-refresh-btn"
-            onClick={() => void loadBriefing()}
+            onClick={() => void loadHistory(selectedDate || undefined)}
             disabled={loading || generating}
           >
             {loading ? "Loading…" : "Refresh"}
@@ -131,9 +176,13 @@ export default function BriefingPanel() {
             type="button"
             className="inbox-refresh-btn"
             onClick={() => void generateBriefing()}
-            disabled={loading || generating}
+            disabled={loading || generating || !selectedDate}
           >
-            {generating ? "Generating…" : "Generate briefing"}
+            {generating
+              ? "Generating…"
+              : selectedDay?.has_briefing
+                ? "Regenerate for this day"
+                : "Generate briefing"}
           </button>
         </div>
       </div>
@@ -144,16 +193,55 @@ export default function BriefingPanel() {
         </p>
       )}
 
+      {!loading && days.length > 0 && (
+        <div className="briefing-date-strip" role="tablist" aria-label="Briefing dates">
+          {days.map((day) => {
+            const label = formatDayLabel(day.date);
+            const isSelected = day.date === selectedDate;
+            const isToday = day.date === today;
+            return (
+              <button
+                key={day.date}
+                type="button"
+                role="tab"
+                aria-selected={isSelected}
+                className={[
+                  "briefing-date-chip",
+                  isSelected ? "active" : "",
+                  day.has_briefing ? "has-briefing" : "empty-day",
+                  isToday ? "is-today" : "",
+                ]
+                  .filter(Boolean)
+                  .join(" ")}
+                onClick={() => setSelectedDate(day.date)}
+              >
+                <span className="briefing-date-weekday">{label.weekday}</span>
+                <span className="briefing-date-day">{label.day}</span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       {loading && !briefing ? (
         <p className="inbox-message">Loading briefing…</p>
-      ) : !briefing ? (
+      ) : !selectedDay ? (
         <div className="inbox-message">
-          <p>{emptyMessage || "No briefing yet."}</p>
+          <p>No briefing history available yet.</p>
           <p className="briefing-hint">
             Click <strong>Generate briefing</strong> (requires{" "}
             <code>ENABLE_MANUAL_SYNC=true</code>), or wait for the daily
             scheduler job.
           </p>
+        </div>
+      ) : !selectedDay.has_briefing || !briefing ? (
+        <div className="inbox-message">
+          <p>No briefing for this day.</p>
+          {selectedDate === today && (
+            <p className="briefing-hint">
+              Generate one for today, or wait for the scheduled job.
+            </p>
+          )}
         </div>
       ) : (
         <div className="briefing-body">

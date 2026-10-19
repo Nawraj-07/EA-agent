@@ -59,6 +59,80 @@
   color: #94a3b8 !important;
 }
 
+.inbox-category-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.inbox-category-tab {
+  padding: 8px 14px;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: #475569;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.inbox-category-tab.active {
+  color: #1d4ed8;
+  background: #eff6ff;
+  border-color: #bfdbfe;
+}
+
+.inbox-load-more {
+  width: 100%;
+  margin-top: 10px;
+  padding: 10px;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: #1e40af;
+  background: #eff6ff;
+  border: 1px dashed #93c5fd;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.inbox-load-more:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.inbox-analysis-status {
+  font-size: 0.875rem;
+  color: #b45309;
+}
+
+.thread-messages {
+  margin: 12px 0;
+}
+
+.thread-messages ul {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0 0;
+}
+
+.thread-messages li button {
+  width: 100%;
+  text-align: left;
+  padding: 6px 8px;
+  margin-bottom: 4px;
+  font-size: 0.8rem;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.thread-messages li button.active {
+  border-color: #93c5fd;
+  background: #eff6ff;
+}
+
 .email-count {
   flex-shrink: 0;
   padding: 6px 14px;
@@ -616,6 +690,67 @@
   margin: 0;
   font-size: 1.1rem;
   color: #0f172a;
+}
+
+.briefing-timezone {
+  margin: 4px 0 0;
+  font-size: 0.75rem;
+  color: #94a3b8;
+}
+
+.briefing-date-strip {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 4px 0 14px;
+  margin-bottom: 4px;
+}
+
+.briefing-date-chip {
+  flex: 0 0 auto;
+  min-width: 52px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  cursor: pointer;
+  color: #475569;
+}
+
+.briefing-date-chip.has-briefing {
+  border-color: #cbd5e1;
+}
+
+.briefing-date-chip.empty-day {
+  opacity: 0.72;
+}
+
+.briefing-date-chip.is-today {
+  box-shadow: inset 0 -2px 0 #93c5fd;
+}
+
+.briefing-date-chip.active {
+  color: #1d4ed8;
+  background: #eff6ff;
+  border-color: #bfdbfe;
+  opacity: 1;
+}
+
+.briefing-date-weekday {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.briefing-date-day {
+  font-size: 1rem;
+  font-weight: 700;
+  line-height: 1.1;
 }
 
 .briefing-body h3 {
