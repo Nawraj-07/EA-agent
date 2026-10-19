@@ -22,12 +22,18 @@ from uuid import UUID
 from db import get_stored_email, save_draft
 from draft_service import generate_email_draft, is_no_reply_needed
 from gmail_service import extract_email_address, send_gmail_reply
-from schemas import ChatRequest
-from chat_service import answer_email_question
-from db import list_stored_emails, get_stored_email
-from db import save_email_and_analysis
-from schemas import AnalyzeRequest
+from schemas import ChatRequest, AnalyzeRequest
+from chat_service import retrieve_emails_for_question, run_chat
+from db import (
+    list_conversations,
+    list_stored_emails,
+    list_thread_messages,
+    get_stored_email,
+    save_email_and_analysis,
+    search_emails_for_chat,
+)
 from ai_service import analyze_email_content
+from gmail_sync import get_profile_email
 from html import unescape
 from pathlib import Path
 from html.parser import HTMLParser
@@ -445,10 +451,27 @@ def analyze_email(payload: AnalyzeRequest):
 
 # ========== SECTION 15: DATABASE READ APIS (TASK 4.4) ==========
 
-@app.get("/db/emails")
-def get_saved_emails():
+def _connected_gmail_account() -> str | None:
+    """Best-effort connected account email for scoping DB reads."""
     try:
-        return list_stored_emails()
+        return get_profile_email(load_gmail_credentials())
+    except Exception:
+        return None
+
+
+@app.get("/db/emails")
+def get_saved_emails(
+    limit: int = 20,
+    cursor_internal_date: int | None = None,
+):
+    try:
+        account = _connected_gmail_account()
+        return list_stored_emails(
+            limit=max(1, min(limit, 100)),
+            gmail_account_email=account,
+            in_inbox_only=True,
+            cursor_internal_date=cursor_internal_date,
+        )
 
     except Exception as exc:
         logger.exception("Failed to load stored emails")
@@ -456,6 +479,138 @@ def get_saved_emails():
             status_code=502,
             detail="Unable to fetch saved emails."
         ) from exc
+
+
+def _parse_optional_iso_date(value: str | None, *, field: str) -> str | None:
+    from datetime import date
+
+    if value is None or value == "":
+        return None
+    text = value.strip()
+    try:
+        date.fromisoformat(text[:10])
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid {field}; expected YYYY-MM-DD.",
+        ) from exc
+    return text[:10]
+
+
+@app.get("/db/conversations")
+def get_conversations(
+    category: str = "primary",
+    limit: int = 20,
+    cursor_internal_date: int | None = None,
+    cursor_thread_id: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+):
+    """
+    Gmail-style conversation list (newest thread activity first).
+
+    Default category=primary (INBOX + CATEGORY_PERSONAL).
+    Other values: promotions, social, inbox (all INBOX).
+
+    Optional date_from / date_to (YYYY-MM-DD) filter threads with message
+    activity in that inclusive local-calendar range (BRIEFING_TIMEZONE).
+    """
+    allowed = {"primary", "promotions", "social", "inbox"}
+    if category not in allowed:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid category. Use one of: {', '.join(sorted(allowed))}",
+        )
+
+    date_from_iso = _parse_optional_iso_date(date_from, field="date_from")
+    date_to_iso = _parse_optional_iso_date(date_to, field="date_to")
+
+    account = _connected_gmail_account()
+    if not account:
+        raise HTTPException(
+            status_code=401,
+            detail="Gmail not connected. Complete OAuth before loading inbox.",
+        )
+
+    try:
+        return list_conversations(
+            gmail_account_email=account,
+            category=category,
+            limit=max(1, min(limit, 50)),
+            cursor_internal_date=cursor_internal_date,
+            cursor_thread_id=cursor_thread_id,
+            date_from_iso=date_from_iso,
+            date_to_iso=date_to_iso,
+        )
+    except Exception as exc:
+        logger.exception("Failed to load conversations")
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to fetch conversations.",
+        ) from exc
+
+
+@app.get("/db/conversations/{thread_id}")
+def get_conversation_thread(thread_id: str):
+    account = _connected_gmail_account()
+    if not account:
+        raise HTTPException(
+            status_code=401,
+            detail="Gmail not connected.",
+        )
+
+    try:
+        messages = list_thread_messages(
+            gmail_account_email=account,
+            thread_id=thread_id,
+        )
+    except Exception as exc:
+        logger.exception("Failed to load thread")
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to fetch conversation thread.",
+        ) from exc
+
+    if not messages:
+        raise HTTPException(status_code=404, detail="Thread not found.")
+
+    return {"thread_id": thread_id, "messages": messages}
+
+
+@app.post("/db/inbox/sync")
+def sync_inbox_now():
+    """
+    Trigger one Gmail sync cycle then return stats (frontend Refresh Inbox).
+
+    Gated by ENABLE_MANUAL_SYNC=true (same as /internal/sync-now).
+    """
+    enabled = os.getenv("ENABLE_MANUAL_SYNC", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not enabled:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Manual inbox sync is disabled. Set ENABLE_MANUAL_SYNC=true "
+                "in .env for local testing."
+            ),
+        )
+
+    from scheduler import run_gmail_sync_once
+
+    try:
+        stats = run_gmail_sync_once()
+    except Exception as exc:
+        logger.exception("Manual inbox sync failed")
+        raise HTTPException(
+            status_code=502,
+            detail="Inbox sync failed. Check backend logs.",
+        ) from exc
+
+    return {"ok": True, "stats": stats}
 
 
 @app.get("/db/emails/{email_id}")
@@ -478,10 +633,15 @@ def get_saved_email(email_id: str):
 
     return email
 
-from uuid import UUID
 
 @app.post("/chat")
 def chat_with_emails(payload: ChatRequest):
+    """
+    Ask My Inbox. Backward compatible: always returns {answer}.
+    Extended: optional history, NL retrieval filters, sources[].
+    """
+    account = _connected_gmail_account()
+
     try:
         if payload.email_id:
             try:
@@ -493,16 +653,29 @@ def chat_with_emails(payload: ChatRequest):
                 )
 
             email = get_stored_email(payload.email_id)
-
             if email is None:
                 raise HTTPException(
                     status_code=404,
                     detail="Email not found."
                 )
-
             emails = [email]
         else:
-            emails = list_stored_emails(limit=5)
+            if not account:
+                raise HTTPException(
+                    status_code=401,
+                    detail=(
+                        "Gmail not connected. Complete OAuth before "
+                        "asking the inbox."
+                    ),
+                )
+            emails = retrieve_emails_for_question(
+                payload.question,
+                gmail_account_email=account,
+                email_id=None,
+                get_stored_email=get_stored_email,
+                search_emails_for_chat=search_emails_for_chat,
+                list_stored_emails=list_stored_emails,
+            )
 
     except HTTPException:
         raise
@@ -513,19 +686,12 @@ def chat_with_emails(payload: ChatRequest):
             detail="Unable to load email context."
         )
 
-    if not emails:
-        return {
-            "answer": "I don't have any saved emails to answer from."
-        }
-
     try:
-        answer = answer_email_question(
+        return run_chat(
             question=payload.question,
             emails=emails,
+            history=payload.history,
         )
-
-        return {"answer": answer}
-
     except Exception:
         logger.exception("AI chat failed")
         raise HTTPException(
@@ -903,10 +1069,15 @@ def trigger_gmail_sync_now():
 
 
 # ========== SECTION 20: DAILY BRIEFINGS (TASK 6.2) ==========
+def _briefing_table_missing(exc: Exception) -> bool:
+    message = str(exc)
+    return "daily_briefings" in message or "PGRST205" in message
+
+
 @app.get("/db/briefings/latest")
 def get_latest_daily_briefing():
     """
-    Return the most recent stored daily briefing.
+    Return the most recent stored daily briefing for the connected account.
 
     Distinguishes:
     - 200 + briefing object → row exists
@@ -914,13 +1085,21 @@ def get_latest_daily_briefing():
     - 503 → migration missing
     - 502 → unexpected DB/API failure
     """
+    account = _connected_gmail_account()
+    if not account:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Gmail not connected. Complete OAuth before loading briefings."
+            ),
+        )
+
     try:
         from db import get_latest_briefing
 
-        briefing = get_latest_briefing()
+        briefing = get_latest_briefing(gmail_account_email=account)
     except Exception as exc:
-        message = str(exc)
-        if "daily_briefings" in message or "PGRST205" in message:
+        if _briefing_table_missing(exc):
             logger.warning(
                 "daily_briefings table missing; run docs/migrations/"
                 "2026-10-16_daily_briefings.sql in Supabase"
@@ -951,16 +1130,61 @@ def get_latest_daily_briefing():
         }
 
     logger.info(
-        "GET /db/briefings/latest: found id=%s",
+        "GET /db/briefings/latest: found id=%s account=%s",
         briefing.get("id"),
+        account,
     )
     return {"briefing": briefing, "status": "ok"}
 
 
+@app.get("/db/briefings/history")
+def get_briefing_history():
+    """
+    Today + previous 7 calendar days of saved briefings (no OpenAI).
+
+    Days without a briefing still appear with has_briefing=false.
+    Per day, the latest successful (saved) row by created_at wins.
+    """
+    account = _connected_gmail_account()
+    if not account:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Gmail not connected. Complete OAuth before loading briefings."
+            ),
+        )
+
+    try:
+        from briefing_service import get_briefing_history_for_account
+
+        payload = get_briefing_history_for_account(account)
+    except Exception as exc:
+        if _briefing_table_missing(exc):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "daily_briefings table is missing or outdated. "
+                    "Run docs/migrations/2026-10-16_daily_briefings.sql and "
+                    "docs/migrations/2026-10-19_briefing_account_history.sql."
+                ),
+            ) from exc
+        logger.exception("Failed to load briefing history")
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to fetch briefing history.",
+        ) from exc
+
+    return payload
+
+
 @app.post("/internal/briefing-now")
-def trigger_daily_briefing_now():
+def trigger_daily_briefing_now(date: str | None = None):
     """
     Generate one daily briefing immediately (local/testing helper).
+
+    Optional query `date=YYYY-MM-DD` scopes the briefing to that calendar day
+    (must be today or within the previous 7 days in BRIEFING_TIMEZONE).
+    Omit date to generate for today.
 
     Disabled unless ENABLE_MANUAL_SYNC=true (same gate as sync-now).
     """
@@ -982,7 +1206,7 @@ def trigger_daily_briefing_now():
     from scheduler import run_daily_briefing_once
 
     try:
-        stats = run_daily_briefing_once()
+        stats = run_daily_briefing_once(target_date=date)
     except Exception as exc:
         logger.exception("Manual daily briefing failed (status=generation_failed)")
         raise HTTPException(
@@ -991,6 +1215,11 @@ def trigger_daily_briefing_now():
         ) from exc
 
     status = (stats or {}).get("status")
+    if status == "invalid_date":
+        raise HTTPException(
+            status_code=422,
+            detail=(stats or {}).get("error") or "Invalid briefing date.",
+        )
     if status in {"load_failed", "generation_failed", "save_failed"}:
         logger.error("Manual briefing incomplete stats=%s", stats)
         raise HTTPException(

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import "./Inbox.css";
 import ChatPanel from "./ChatPanel";
 import DraftPanel from "./DraftPanel";
-import BriefingPanel from "./BriefingPanel";
+import { useBriefingVisibleRange } from "./hooks/useBriefingVisibleRange";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 const AUTO_REFRESH_MS = 60_000;
@@ -91,6 +91,10 @@ export default function Inbox() {
   const [error, setError] = useState("");
   const [detailError, setDetailError] = useState("");
   const [lastRefreshedAt, setLastRefreshedAt] = useState<Date | null>(null);
+  const { visibleRange, rangeReady } = useBriefingVisibleRange();
+
+  const dateFrom = visibleRange?.startDate ?? null;
+  const dateTo = visibleRange?.endDate ?? null;
 
   const loadConversations = useCallback(
     async (options?: {
@@ -98,10 +102,15 @@ export default function Inbox() {
       append?: boolean;
       cursor?: ConversationsResponse["next_cursor"];
       cat?: InboxCategory;
+      from?: string | null;
+      to?: string | null;
     }) => {
       const silent = options?.silent ?? false;
       const append = options?.append ?? false;
       const cat = options?.cat ?? category;
+      const from =
+        options?.from !== undefined ? options.from : dateFrom;
+      const to = options?.to !== undefined ? options.to : dateTo;
 
       try {
         if (append) {
@@ -123,6 +132,12 @@ export default function Inbox() {
             String(options.cursor.internal_date)
           );
           params.set("cursor_thread_id", options.cursor.thread_id);
+        }
+        if (from) {
+          params.set("date_from", from);
+        }
+        if (to) {
+          params.set("date_to", to);
         }
 
         const response = await fetch(
@@ -158,12 +173,20 @@ export default function Inbox() {
         setLoadingMore(false);
       }
     },
-    [category]
+    [category, dateFrom, dateTo]
   );
 
   useEffect(() => {
-    void loadConversations({ cat: category });
-  }, [category, loadConversations]);
+    if (!rangeReady) return;
+    setNextCursor(null);
+    setSelectedEmail(null);
+    setThreadMessages([]);
+    void loadConversations({
+      cat: category,
+      from: dateFrom,
+      to: dateTo,
+    });
+  }, [category, rangeReady, dateFrom, dateTo, loadConversations]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -194,6 +217,29 @@ export default function Inbox() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Sync failed");
       setRefreshing(false);
+    }
+  }
+
+  async function openEmailById(emailId: string) {
+    setDetailLoading(true);
+    setDetailError("");
+    try {
+      const response = await fetch(`${API}/db/emails/${emailId}`);
+      if (!response.ok) {
+        throw new Error(`Failed to load email (${response.status})`);
+      }
+      const data: Email = await response.json();
+      setSelectedEmail(data);
+      setThreadMessages((prev) => {
+        if (prev.some((m) => m.id === data.id)) return prev;
+        return [...prev, data];
+      });
+    } catch (err) {
+      setDetailError(
+        err instanceof Error ? err.message : "Something went wrong"
+      );
+    } finally {
+      setDetailLoading(false);
     }
   }
 
@@ -280,13 +326,14 @@ export default function Inbox() {
           </button>
           <span className="email-count">
             {conversations.length} Conversations
+            {visibleRange
+              ? ` · ${visibleRange.startDate} → ${visibleRange.endDate}`
+              : ""}
           </span>
         </div>
       </header>
 
       {error && <div className="inbox-error">{error}</div>}
-
-      <BriefingPanel />
 
       <div className="inbox-category-tabs" role="tablist">
         {CATEGORY_TABS.map((tab) => (
@@ -309,14 +356,14 @@ export default function Inbox() {
         ))}
       </div>
 
-      {loading ? (
+      {!rangeReady || loading ? (
         <p className="inbox-message">Loading conversations…</p>
       ) : error && conversations.length === 0 ? null : conversations.length ===
         0 ? (
         <p className="inbox-message">
-          No conversations in this view yet. Click Refresh inbox to sync from
-          Gmail (requires ENABLE_MANUAL_SYNC=true), or wait for the 15-minute
-          scheduler.
+          {visibleRange
+            ? `No conversations in this date range (${visibleRange.startDate} → ${visibleRange.endDate}). Click Refresh inbox to sync more mail from Gmail if local data is incomplete.`
+            : "No conversations in this view yet. Click Refresh inbox to sync from Gmail (requires ENABLE_MANUAL_SYNC=true), or wait for the 15-minute scheduler."}
         </p>
       ) : (
         <div className="inbox-layout">
@@ -488,7 +535,10 @@ export default function Inbox() {
               </>
             )}
 
-            <ChatPanel emailId={selectedEmail?.id} />
+            <ChatPanel
+              emailId={selectedEmail?.id}
+              onOpenEmail={(id) => void openEmailById(id)}
+            />
           </main>
         </div>
       )}

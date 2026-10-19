@@ -48,7 +48,19 @@ function formatDayLabel(isoDate: string): { weekday: string; day: string } {
   };
 }
 
-export default function BriefingPanel() {
+export type BriefingVisibleRange = {
+  startDate: string;
+  endDate: string;
+  timezone: string;
+};
+
+type BriefingPanelProps = {
+  onVisibleRangeChange?: (range: BriefingVisibleRange | null) => void;
+};
+
+export default function BriefingPanel({
+  onVisibleRangeChange,
+}: BriefingPanelProps) {
   const [days, setDays] = useState<HistoryDay[]>([]);
   const [today, setToday] = useState("");
   const [timezone, setTimezone] = useState("");
@@ -94,13 +106,26 @@ export default function BriefingPanel() {
             : nextDays[nextDays.length - 1]?.date || "";
 
       setSelectedDate(preferred);
+
+      const startDate = nextDays[0]?.date;
+      const endDate = nextDays[nextDays.length - 1]?.date;
+      if (startDate && endDate) {
+        onVisibleRangeChange?.({
+          startDate,
+          endDate,
+          timezone: payload.timezone || "",
+        });
+      } else {
+        onVisibleRangeChange?.(null);
+      }
     } catch (err) {
       setDays([]);
       setError(err instanceof Error ? err.message : "Something went wrong");
+      onVisibleRangeChange?.(null);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [onVisibleRangeChange]);
 
   useEffect(() => {
     void loadHistory();

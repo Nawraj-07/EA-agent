@@ -1,9 +1,19 @@
 :root {
-  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  --background: #f3efe8;
+  --surface: #ffffff;
+  --surface-soft: #f7f3ed;
+  --primary: #1e3a5f;
+  --primary-hover: #18304f;
+  --primary-active: #13263f;
+  --text-primary: #0f172a;
+  --text-muted: #64748b;
+  --border: #e8e2d9;
+
+  font-family: Inter, "Segoe UI", system-ui, -apple-system, sans-serif;
   line-height: 1.5;
   font-weight: 400;
-  color: #1e293b;
-  background-color: #f5f7fa;
+  color: var(--text-primary);
+  background-color: var(--background);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -27,6 +37,8 @@ body,
 
 body {
   margin: 0;
+  background: var(--background);
+  color: var(--text-primary);
 }
 
 button {
