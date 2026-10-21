@@ -757,6 +757,11 @@
   border-color: var(--border);
 }
 
+.chat-turn-pending p {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
 .chat-turn p {
   margin: 6px 0 0;
   white-space: pre-wrap;

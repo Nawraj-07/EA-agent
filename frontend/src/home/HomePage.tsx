@@ -5,6 +5,7 @@ import DraftPanel from "../DraftPanel";
 import { useBriefingHistory } from "../hooks/useBriefingHistory";
 import "../Inbox.css";
 import "./Home.css";
+import ProfileChip from "./ProfileChip";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 const AUTO_REFRESH_MS = 60_000;
@@ -106,7 +107,13 @@ function senderInitial(sender: string | null | undefined): string {
 
 function formatBriefingSubtitle(isoDate: string, headline?: string): string {
   if (headline) return headline;
+  if (!isoDate || !/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) {
+    return "Daily Executive Briefing";
+  }
   const parsed = new Date(`${isoDate}T12:00:00`);
+  if (Number.isNaN(parsed.getTime())) {
+    return "Daily Executive Briefing";
+  }
   return `Daily Executive Briefing – ${parsed.toLocaleDateString(undefined, {
     month: "long",
     day: "numeric",
@@ -227,7 +234,7 @@ export default function HomePage() {
   );
 
   useEffect(() => {
-    if (!rangeReady || !dateFrom || !dateTo) return;
+    if (!rangeReady) return;
     setNextCursor(null);
     setSelectedEmail(null);
     setThreadMessages([]);
@@ -324,6 +331,36 @@ export default function HomePage() {
   }
 
   const analysis = getAnalysis(selectedEmail);
+  const analysisPending =
+    Boolean(selectedEmail) &&
+    !analysis &&
+    selectedEmail?.analysis_status !== "failed";
+  const analysisFailed =
+    Boolean(selectedEmail) &&
+    !analysis &&
+    selectedEmail?.analysis_status === "failed";
+
+  useEffect(() => {
+    if (!selectedEmail?.id || analysis || selectedEmail.analysis_status === "failed") {
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setInterval(async () => {
+      try {
+        const response = await fetch(`${API}/db/emails/${selectedEmail.id}`);
+        if (!response.ok || cancelled) return;
+        const data: Email = await response.json();
+        if (cancelled) return;
+        setSelectedEmail(data);
+      } catch {
+        /* Keep showing Analyzing until the next poll. */
+      }
+    }, 4000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [selectedEmail?.id, selectedEmail?.analysis_status, analysis]);
 
   const briefingContent = selectedDay?.briefing?.content;
   const briefingItems = useMemo(() => {
@@ -469,6 +506,7 @@ export default function HomePage() {
               </svg>
               {refreshing ? "Syncing…" : "Refresh inbox"}
             </button>
+            <ProfileChip />
           </div>
         </div>
       </header>
@@ -537,7 +575,10 @@ export default function HomePage() {
 
       {(error || briefingError) && (
         <div className="home-error" role="alert">
-          {error || briefingError}
+          {error || briefingError}{" "}
+          {/gmail|oauth|reconnect/i.test(error || briefingError) ? (
+            <a href={`${API}/auth/google`}>Connect Gmail</a>
+          ) : null}
         </div>
       )}
 
@@ -713,17 +754,26 @@ export default function HomePage() {
                     </span>
                   )}
                 </h3>
-                <p>{analysis?.summary || "No analysis available yet"}</p>
+                <p>
+                  {analysis?.summary ||
+                    (analysisFailed
+                      ? "Analysis failed. It will be retried on the next sync."
+                      : "Analyzing this email…")}
+                </p>
               </div>
 
               <div className="home-analysis-grid">
                 <div>
                   Category
-                  <strong>{analysis?.category || "N/A"}</strong>
+                  <strong>
+                    {analysis?.category || (analysisPending ? "…" : "N/A")}
+                  </strong>
                 </div>
                 <div>
                   Importance
-                  <strong>{analysis?.importance || "N/A"}</strong>
+                  <strong>
+                    {analysis?.importance || (analysisPending ? "…" : "N/A")}
+                  </strong>
                 </div>
                 <div>
                   Action required
@@ -732,7 +782,9 @@ export default function HomePage() {
                       ? analysis.action_required
                         ? "Yes"
                         : "No"
-                      : "N/A"}
+                      : analysisPending
+                        ? "…"
+                        : "N/A"}
                   </strong>
                 </div>
               </div>

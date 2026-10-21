@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 const MAX_HISTORY_PAIRS = 5;
@@ -14,6 +14,7 @@ type ChatTurn = {
   role: "user" | "assistant";
   content: string;
   sources?: ChatSource[];
+  pending?: boolean;
 };
 
 type ChatPanelProps = {
@@ -36,6 +37,8 @@ export default function ChatPanel({
   const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const lastTurnRef = useRef<HTMLDivElement | null>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     if (initialQuestion) {
@@ -43,19 +46,36 @@ export default function ChatPanel({
     }
   }, [initialQuestion]);
 
+  useEffect(() => {
+    lastTurnRef.current?.scrollIntoView({
+      behavior: "smooth",
+      block: "nearest",
+    });
+  }, [turns, loading]);
+
   async function sendQuestion(event?: React.FormEvent<HTMLFormElement>) {
     event?.preventDefault();
 
     const trimmed = question.trim();
     if (!trimmed || loading) return;
 
+    const historyPayload = turns
+      .filter((t) => !t.pending)
+      .slice(-(MAX_HISTORY_PAIRS * 2))
+      .map((t) => ({
+        role: t.role,
+        content: t.content,
+      }));
+
     setLoading(true);
     setError("");
-
-    const historyPayload = turns.slice(-(MAX_HISTORY_PAIRS * 2)).map((t) => ({
-      role: t.role,
-      content: t.content,
-    }));
+    setQuestion("");
+    setTurns((prev) => [
+      ...prev,
+      { role: "user", content: trimmed },
+      { role: "assistant", content: "Thinking…", pending: true },
+    ]);
+    inputRef.current?.focus();
 
     try {
       const response = await fetch(`${API}/chat`, {
@@ -83,21 +103,34 @@ export default function ChatPanel({
       const answer = data?.answer || "No answer returned.";
       const sources = Array.isArray(data?.sources) ? data.sources : [];
 
-      setTurns((prev) => [
-        ...prev,
-        { role: "user", content: trimmed },
-        { role: "assistant", content: answer, sources },
-      ]);
-      setQuestion("");
+      setTurns((prev) => {
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (last?.pending) {
+          next[next.length - 1] = {
+            role: "assistant",
+            content: answer,
+            sources,
+          };
+          return next;
+        }
+        return [
+          ...next,
+          { role: "assistant", content: answer, sources },
+        ];
+      });
     } catch (err) {
+      setTurns((prev) => prev.filter((turn) => !turn.pending));
       setError(err instanceof Error ? err.message : "Something went wrong");
     } finally {
       setLoading(false);
+      inputRef.current?.focus();
     }
   }
 
   function applySuggestion(text: string) {
     setQuestion(text);
+    inputRef.current?.focus();
   }
 
   return (
@@ -134,38 +167,45 @@ export default function ChatPanel({
 
       {turns.length > 0 && (
         <div className="chat-thread">
-          {turns.map((turn, index) => (
-            <div
-              key={`${turn.role}-${index}`}
-              className={`chat-turn chat-turn-${turn.role}`}
-            >
-              <strong>{turn.role === "user" ? "You" : "AI"}</strong>
-              <p>{turn.content}</p>
-              {turn.role === "assistant" &&
-                turn.sources &&
-                turn.sources.length > 0 && (
-                  <div className="chat-sources">
-                    <span className="chat-sources-label">Sources</span>
-                    {turn.sources.map((src) => (
-                      <button
-                        key={src.email_id}
-                        type="button"
-                        className="chat-source-chip"
-                        onClick={() => onOpenEmail?.(src.email_id)}
-                        title={src.sender || undefined}
-                      >
-                        {src.subject || "Untitled email"}
-                      </button>
-                    ))}
-                  </div>
-                )}
-            </div>
-          ))}
+          {turns.map((turn, index) => {
+            const isLast = index === turns.length - 1;
+            return (
+              <div
+                key={`${turn.role}-${index}`}
+                ref={isLast ? lastTurnRef : undefined}
+                className={`chat-turn chat-turn-${turn.role}${
+                  turn.pending ? " chat-turn-pending" : ""
+                }`}
+              >
+                <strong>{turn.role === "user" ? "You" : "AI"}</strong>
+                <p>{turn.content}</p>
+                {turn.role === "assistant" &&
+                  turn.sources &&
+                  turn.sources.length > 0 && (
+                    <div className="chat-sources">
+                      <span className="chat-sources-label">Sources</span>
+                      {turn.sources.map((src) => (
+                        <button
+                          key={src.email_id}
+                          type="button"
+                          className="chat-source-chip"
+                          onClick={() => onOpenEmail?.(src.email_id)}
+                          title={src.sender || undefined}
+                        >
+                          {src.subject || "Untitled email"}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+              </div>
+            );
+          })}
         </div>
       )}
 
       <form className="chat-ask-form" onSubmit={(e) => void sendQuestion(e)}>
         <input
+          ref={inputRef}
           type="text"
           value={question}
           onChange={(event) => setQuestion(event.target.value)}
