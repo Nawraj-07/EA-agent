@@ -91,7 +91,10 @@ def send_gmail_reply(
     original_gmail_message_id: str | None = None,
 ) -> str:
     """
-    Send a plain-text reply via Gmail and return the sent message id.
+    Send a *new* plain-text reply via Gmail and return the sent message id.
+
+    This never updates, labels, archives, trashes, or deletes an existing
+    message. It only creates a new Sent item (optionally threaded).
 
     Pass already-loaded/refreshed credentials from the app auth helpers.
     Never logs credential material.

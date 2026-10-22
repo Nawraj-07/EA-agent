@@ -33,7 +33,14 @@ from db import (
     search_emails_for_chat,
 )
 from ai_service import analyze_email_content
-from gmail_sync import get_profile_email
+from gmail_safety import (
+    GmailAccessDenied,
+    assert_allowed_gmail_account,
+    assert_credentials_safe,
+    assert_gmail_scopes_safe,
+    get_allowed_gmail_account,
+)
+from gmail_sync import get_connected_profile, get_profile_email
 from html import unescape
 from pathlib import Path
 from html.parser import HTMLParser
@@ -86,12 +93,18 @@ def _cors_allow_origins() -> list[str]:
 if not all((GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, SESSION_SECRET)):
     raise RuntimeError('Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and SESSION_SECRET in .env')
 
+# Read existing mail + send new replies only. Never request modify/delete.
+# userinfo is read-only identity for the Home profile chip.
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
 ]
 TOKEN_PATH = BASE_DIR / 'token.json'
 logger = logging.getLogger(__name__)
+_verified_gmail_account: str | None = None
 
 
 # ========== SECTION 3: FASTAPI LIFESPAN, CORS & SESSION SETUP ==========
@@ -160,7 +173,16 @@ def load_gmail_credentials() -> Credentials:
 
     try:
         token_data = json.loads(TOKEN_PATH.read_text(encoding='utf-8'))
-        creds = Credentials.from_authorized_user_info(token_data, scopes=SCOPES)
+        stored_scopes = token_data.get('scopes') or SCOPES
+        assert_gmail_scopes_safe(stored_scopes)
+        # Refresh with granted scopes only. Extra identity scopes require reconnect.
+        creds = Credentials.from_authorized_user_info(
+            token_data,
+            scopes=stored_scopes,
+        )
+        assert_credentials_safe(creds)
+    except GmailAccessDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except (OSError, ValueError, KeyError, TypeError) as exc:
         logger.warning('Could not load stored Gmail credentials: %s', type(exc).__name__)
         raise HTTPException(status_code=401, detail='Saved Gmail credentials are invalid. Reconnect at /auth/google.') from exc
@@ -175,6 +197,17 @@ def load_gmail_credentials() -> Credentials:
             logger.warning('Could not refresh Gmail credentials: %s', type(exc).__name__)
             raise HTTPException(status_code=401, detail='Gmail token refresh failed. Reconnect at /auth/google.') from exc
 
+    global _verified_gmail_account
+    allowed = get_allowed_gmail_account()
+    if _verified_gmail_account != allowed:
+        try:
+            _verified_gmail_account = assert_allowed_gmail_account(
+                get_profile_email(creds)
+            )
+        except GmailAccessDenied as exc:
+            _verified_gmail_account = None
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+
     return creds
 
 
@@ -184,6 +217,13 @@ def health():
     return {'status': 'ok'}
 
 
+@app.get('/auth/me')
+def auth_me():
+    """Connected Gmail identity for the profile chip. Read-only."""
+    credentials = load_gmail_credentials()
+    return get_connected_profile(credentials)
+
+
 # ========== SECTION 7: GOOGLE LOGIN API (TASK 2.3) ==========
 @app.get('/auth/google')
 def google_login(request: Request):
@@ -191,7 +231,7 @@ def google_login(request: Request):
     authorization_url, state = flow.authorization_url(
         access_type='offline',
         prompt='consent',
-        include_granted_scopes='true',
+        include_granted_scopes='false',
     )
     request.session['oauth_state'] = state
     request.session['code_verifier'] = flow.code_verifier
@@ -223,7 +263,13 @@ def google_callback(
         flow.code_verifier = code_verifier
         flow.fetch_token(code=code)
         credentials = flow.credentials
+        assert_credentials_safe(credentials)
+        connected = get_profile_email(credentials)
+        assert_allowed_gmail_account(connected)
         save_credentials(credentials)
+    except GmailAccessDenied as exc:
+        logger.warning('OAuth rejected: unauthorized Gmail account or scopes')
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except Exception as exc:
         # Avoid logging exception details: OAuth exceptions can contain sensitive data.
         logger.exception('Google OAuth callback failed')
@@ -452,11 +498,20 @@ def analyze_email(payload: AnalyzeRequest):
 # ========== SECTION 15: DATABASE READ APIS (TASK 4.4) ==========
 
 def _connected_gmail_account() -> str | None:
-    """Best-effort connected account email for scoping DB reads."""
+    """Account used to scope DB reads.
+
+    Prefer the live Gmail profile. If the token cannot refresh, still serve
+    local inbox/briefings for the allowlisted mailbox.
+    """
     try:
         return get_profile_email(load_gmail_credentials())
     except Exception:
-        return None
+        allowed = get_allowed_gmail_account()
+        logger.warning(
+            "Live Gmail unavailable; reading local data for %s",
+            allowed,
+        )
+        return allowed or None
 
 
 @app.get("/db/emails")

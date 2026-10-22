@@ -21,7 +21,7 @@ Use this when moving from local learning to a hosted environment.
 - [ ] Create / update OAuth client for production
 - [ ] Authorized redirect URI = `https://<your-api-host>/auth/google/callback`
 - [ ] Consent screen: add production domains / test users as needed
-- [ ] Re-consent so tokens include `gmail.readonly` + `gmail.send`
+- [ ] Re-consent so tokens include `gmail.readonly`, `gmail.send`, `openid`, `userinfo.email`, and `userinfo.profile` (needed for the Home profile photo)
 
 ## 3. Database
 

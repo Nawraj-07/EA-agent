@@ -12,3 +12,4 @@ google-auth-oauthlib==1.5.0
 # APScheduler 3.x only — do not install APScheduler 4.x
 APScheduler>=3.10.0,<4.0.0
 starlette==1.8.0
+itsdangerous>=2.2.0,<3.0.0

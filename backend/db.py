@@ -49,6 +49,35 @@ def email_exists_by_gmail_id(
     return bool(response.data)
 
 
+def existing_gmail_message_ids(
+    gmail_message_ids: list[str],
+    *,
+    gmail_account_email: str,
+) -> set[str]:
+    """Return which of the given Gmail ids already exist locally for the account."""
+    ids = [mid for mid in gmail_message_ids if mid]
+    if not ids or not gmail_account_email:
+        return set()
+
+    client = get_supabase_client()
+    found: set[str] = set()
+    chunk_size = 100
+    for start in range(0, len(ids), chunk_size):
+        chunk = ids[start : start + chunk_size]
+        response = (
+            client.table("emails")
+            .select("gmail_message_id")
+            .eq("gmail_account_email", gmail_account_email)
+            .in_("gmail_message_id", chunk)
+            .execute()
+        )
+        for row in response.data or []:
+            mid = row.get("gmail_message_id")
+            if mid:
+                found.add(str(mid))
+    return found
+
+
 def get_email_by_gmail_id(
     gmail_message_id: str,
     *,
@@ -194,13 +223,15 @@ def list_pending_analysis_emails(
     *,
     gmail_account_email: str,
     limit: int = 20,
+    statuses: list[str] | None = None,
 ) -> list:
     client = get_supabase_client()
+    allowed = statuses or ["pending", "failed"]
     response = (
         client.table("emails")
         .select("*")
         .eq("gmail_account_email", gmail_account_email)
-        .in_("analysis_status", ["pending", "failed"])
+        .in_("analysis_status", allowed)
         .order("internal_date", desc=True)
         .limit(limit)
         .execute()
@@ -489,6 +520,77 @@ def get_sync_state(gmail_account_email: str) -> dict | None:
         .execute()
     )
     return response.data[0] if response.data else None
+
+
+def _count_account_rows(table: str, gmail_account_email: str) -> int:
+    client = get_supabase_client()
+    result = (
+        client.table(table)
+        .select("*", count="exact")
+        .eq("gmail_account_email", gmail_account_email)
+        .limit(1)
+        .execute()
+    )
+    return int(result.count or 0)
+
+
+def inspect_account_row_counts() -> list[dict]:
+    """Counts per gmail_account_email. Does not delete anything."""
+    client = get_supabase_client()
+    accounts: set[str] = set()
+    for table in ("gmail_sync_state", "daily_briefings"):
+        rows = (
+            client.table(table)
+            .select("gmail_account_email")
+            .execute()
+            .data
+            or []
+        )
+        for row in rows:
+            email = (row.get("gmail_account_email") or "").strip().lower()
+            if email:
+                accounts.add(email)
+    return [
+        {
+            "gmail_account_email": account,
+            "emails": _count_account_rows("emails", account),
+            "daily_briefings": _count_account_rows("daily_briefings", account),
+            "gmail_sync_state": _count_account_rows("gmail_sync_state", account),
+        }
+        for account in sorted(accounts)
+    ]
+
+
+def purge_local_account_copies(gmail_account_email: str) -> dict:
+    """
+    Remove leftover *local* copies for a disconnected mailbox.
+
+    Never deletes Gmail. Never deletes gaurang@rbhargavaassociates.in rows.
+    """
+    from gmail_safety import assert_can_purge_local_account
+
+    account = assert_can_purge_local_account(gmail_account_email)
+    before = {
+        "emails": _count_account_rows("emails", account),
+        "daily_briefings": _count_account_rows("daily_briefings", account),
+        "gmail_sync_state": _count_account_rows("gmail_sync_state", account),
+    }
+
+    client = get_supabase_client()
+    client.table("emails").delete().eq("gmail_account_email", account).execute()
+    client.table("daily_briefings").delete().eq(
+        "gmail_account_email", account
+    ).execute()
+    client.table("gmail_sync_state").delete().eq(
+        "gmail_account_email", account
+    ).execute()
+
+    after = {
+        "emails": _count_account_rows("emails", account),
+        "daily_briefings": _count_account_rows("daily_briefings", account),
+        "gmail_sync_state": _count_account_rows("gmail_sync_state", account),
+    }
+    return {"account": account, "before": before, "after": after}
 
 
 def upsert_sync_state(

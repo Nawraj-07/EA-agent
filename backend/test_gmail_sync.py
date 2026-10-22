@@ -189,10 +189,56 @@ def test_upsert_idempotent_conflict_key():
     assert row["id"] == "uuid-1"
 
 
+def test_get_google_userinfo_skipped_without_scope():
+    creds = MagicMock()
+    creds.scopes = ["https://www.googleapis.com/auth/gmail.readonly"]
+    try:
+        gmail_sync.get_google_userinfo(creds)
+        raise AssertionError("expected RuntimeError")
+    except RuntimeError as exc:
+        assert "userinfo" in str(exc).lower()
+
+
+def test_get_connected_profile_includes_photo():
+    fake_creds = object()
+    with (
+        patch("gmail_sync.get_profile_email", return_value="gaurang@rbhargavaassociates.in"),
+        patch(
+            "gmail_sync.get_google_userinfo",
+            return_value={
+                "email": "gaurang@rbhargavaassociates.in",
+                "name": "Gaurang",
+                "picture": "https://example.com/photo.jpg",
+            },
+        ),
+    ):
+        profile = gmail_sync.get_connected_profile(fake_creds)
+
+    assert profile["email"] == "gaurang@rbhargavaassociates.in"
+    assert profile["name"] == "Gaurang"
+    assert profile["picture"] == "https://example.com/photo.jpg"
+
+
+def test_get_connected_profile_falls_back_without_userinfo():
+    fake_creds = object()
+    with (
+        patch("gmail_sync.get_profile_email", return_value="gaurang@rbhargavaassociates.in"),
+        patch("gmail_sync.get_google_userinfo", side_effect=RuntimeError("no userinfo")),
+    ):
+        profile = gmail_sync.get_connected_profile(fake_creds)
+
+    assert profile["email"] == "gaurang@rbhargavaassociates.in"
+    assert profile["name"] is None
+    assert profile["picture"] is None
+
+
 if __name__ == "__main__":
     test_message_matches_category_primary_and_inbox()
     test_parse_history_archive_and_add()
     test_list_history_expired_raises()
     test_conversation_grouping_order_by_internal_date()
     test_upsert_idempotent_conflict_key()
+    test_get_google_userinfo_skipped_without_scope()
+    test_get_connected_profile_includes_photo()
+    test_get_connected_profile_falls_back_without_userinfo()
     print("All gmail_sync tests passed.")

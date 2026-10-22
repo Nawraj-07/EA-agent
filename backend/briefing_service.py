@@ -384,6 +384,32 @@ def run_daily_briefing(target_date: date | str | None = None) -> dict:
         stats["status"] = "load_failed"
         return stats
 
+    if not emails:
+        try:
+            from main import load_gmail_credentials
+            from scheduler import ingest_inbox_for_local_day
+
+            logger.info(
+                "No local emails for %s; ingesting that day's INBOX from Gmail",
+                briefing_day.isoformat(),
+            )
+            ingest_inbox_for_local_day(
+                load_gmail_credentials(),
+                account,
+                briefing_day,
+            )
+            emails = list_emails_for_briefing_day(
+                gmail_account_email=account,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                limit=max_emails,
+            )
+        except Exception:
+            logger.exception(
+                "Gmail day ingest for briefing failed date=%s",
+                briefing_day.isoformat(),
+            )
+
     # Today-only: preserve lookback + newest-mail fallback for first-run UX.
     if not emails and briefing_day == today:
         lookback_start = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)

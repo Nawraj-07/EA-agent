@@ -3,14 +3,19 @@
 Gmail list / get / history helpers for inbox synchronization.
 
 Ingest only — does not call OpenAI. Used by scheduler and inbox sync API.
+Never trash, delete, or modify existing Gmail messages.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
 from typing import Any
+from urllib.error import HTTPError as UrlHTTPError
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -19,6 +24,14 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH_SIZE = 100
 MAX_RETRIES = 5
+USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
+USERINFO_SCOPES = frozenset(
+    {
+        "openid",
+        "https://www.googleapis.com/auth/userinfo.profile",
+        "https://www.googleapis.com/auth/userinfo.email",
+    }
+)
 
 
 class HistoryExpiredError(Exception):
@@ -85,12 +98,67 @@ def get_profile_history_id(credentials: Any) -> str | None:
     return str(hid) if hid is not None else None
 
 
+def _has_userinfo_scope(credentials: Any) -> bool:
+    raw = getattr(credentials, "scopes", None)
+    if not raw:
+        return False
+    if isinstance(raw, str):
+        scopes = {part.strip() for part in raw.replace(",", " ").split() if part.strip()}
+    else:
+        scopes = {str(item).strip() for item in raw if str(item).strip()}
+    return bool(scopes & USERINFO_SCOPES)
+
+
+def get_google_userinfo(credentials: Any) -> dict[str, str | None]:
+    """Read-only Google account name and photo. Does not touch Gmail mail."""
+    if not _has_userinfo_scope(credentials):
+        raise RuntimeError("userinfo scope not granted")
+    token = getattr(credentials, "token", None)
+    if not token:
+        raise RuntimeError("Missing access token")
+    request = Request(
+        USERINFO_URL,
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urlopen(request, timeout=8) as resp:
+            info = json.loads(resp.read().decode())
+    except (UrlHTTPError, URLError, TimeoutError, ValueError) as exc:
+        raise RuntimeError("Google userinfo request failed") from exc
+    if not isinstance(info, dict):
+        raise RuntimeError("Google userinfo returned an unexpected payload")
+    email = (info.get("email") or "").strip().lower() or None
+    name = (info.get("name") or "").strip() or None
+    picture = (info.get("picture") or "").strip() or None
+    return {"email": email, "name": name, "picture": picture}
+
+
+def get_connected_profile(credentials: Any) -> dict[str, str | None]:
+    """Identity for the UI chip. Gmail email always; photo if userinfo is granted."""
+    email = get_profile_email(credentials)
+    payload: dict[str, str | None] = {
+        "email": email,
+        "name": None,
+        "picture": None,
+    }
+    try:
+        info = get_google_userinfo(credentials)
+        if info.get("name"):
+            payload["name"] = info["name"]
+        if info.get("picture"):
+            payload["picture"] = info["picture"]
+    except Exception:
+        logger.info("Google userinfo unavailable; profile photo omitted")
+    return payload
+
+
 def list_messages_page(
     credentials: Any,
     *,
     label_ids: list[str] | None = None,
     page_token: str | None = None,
     max_results: int | None = None,
+    q: str | None = None,
 ) -> dict[str, Any]:
     """
     One page of users.messages.list.
@@ -107,6 +175,8 @@ def list_messages_page(
         kwargs["labelIds"] = label_ids
     if page_token:
         kwargs["pageToken"] = page_token
+    if q:
+        kwargs["q"] = q
 
     result = _execute_with_backoff(service.users().messages().list(**kwargs))
     ids = [m["id"] for m in (result.get("messages") or []) if m.get("id")]
