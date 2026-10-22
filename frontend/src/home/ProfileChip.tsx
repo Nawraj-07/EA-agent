@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-
-const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+import { API } from "../api";
 
 type Profile = {
   email: string;

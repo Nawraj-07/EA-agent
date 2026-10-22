@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-
-const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+import { API } from "./api";
 const MAX_HISTORY_PAIRS = 5;
 
 type ChatSource = {

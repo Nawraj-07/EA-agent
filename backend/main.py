@@ -64,7 +64,7 @@ load_dotenv(BASE_DIR.parent / '.env', override=False)
 GOOGLE_CLIENT_ID = os.getenv('GOOGLE_CLIENT_ID')
 GOOGLE_CLIENT_SECRET = os.getenv('GOOGLE_CLIENT_SECRET')
 GOOGLE_REDIRECT_URI = os.getenv('GOOGLE_REDIRECT_URI', 'http://localhost:8000/auth/google/callback')
-FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:3000')
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:3003')
 SESSION_SECRET = os.getenv('SESSION_SECRET')
 SESSION_HTTPS_ONLY = os.getenv('SESSION_HTTPS_ONLY', 'false').strip().lower() in {
     '1',
@@ -86,8 +86,8 @@ def _cors_allow_origins() -> list[str]:
         if cleaned and cleaned not in origins:
             origins.append(cleaned)
     if 'http://localhost:3000' not in origins and primary.startswith('http://localhost'):
-        origins.append('http://localhost:3000')
-    return origins or ['http://localhost:3000']
+        origins.append('http://localhost:3003')
+    return origins or ['http://localhost:3003']
 
 
 if not all((GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, SESSION_SECRET)):

@@ -3,8 +3,7 @@ import "./Inbox.css";
 import ChatPanel from "./ChatPanel";
 import DraftPanel from "./DraftPanel";
 import { useBriefingVisibleRange } from "./hooks/useBriefingVisibleRange";
-
-const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+import { API } from "./api";
 const AUTO_REFRESH_MS = 60_000;
 const PAGE_SIZE = 20;
 

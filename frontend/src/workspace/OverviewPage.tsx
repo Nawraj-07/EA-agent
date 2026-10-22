@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { Link, useNavigate } from "react-router-dom";
-
-const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+import { API } from "../api";
 
 type BriefingContent = {
   headline?: string;

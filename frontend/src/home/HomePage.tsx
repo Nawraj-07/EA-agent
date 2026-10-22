@@ -6,8 +6,7 @@ import { useBriefingHistory } from "../hooks/useBriefingHistory";
 import "../Inbox.css";
 import "./Home.css";
 import ProfileChip from "./ProfileChip";
-
-const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+import { API } from "../api";
 const AUTO_REFRESH_MS = 60_000;
 const PAGE_SIZE = 20;
 
