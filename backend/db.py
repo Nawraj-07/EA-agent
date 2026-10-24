@@ -376,7 +376,7 @@ def _first_analysis(row: dict):
 def list_conversations(
     *,
     gmail_account_email: str,
-    category: str = "primary",
+    category: str = "inbox",
     limit: int = 20,
     cursor_internal_date: int | None = None,
     cursor_thread_id: str | None = None,
@@ -386,6 +386,7 @@ def list_conversations(
     """
     Conversation list matching Gmail-style newest-first threads.
 
+    Default category=inbox (every INBOX row). Other tabs filter Gmail labels.
     Groups by gmail_thread_id; orders by latest message internal_date DESC.
     Optional date_from_iso / date_to_iso (YYYY-MM-DD) filter on internal_date
     using BRIEFING_TIMEZONE day boundaries (inclusive both ends).
@@ -394,72 +395,84 @@ def list_conversations(
     from gmail_sync import message_matches_category
 
     client = get_supabase_client()
-    fetch_limit = max(limit * 8, 80)
+    scan_batch = 200
+    max_scan_rows = 4000
     start_ms, end_ms = date_iso_to_internal_ms_range(date_from_iso, date_to_iso)
-
-    query = (
-        client.table("emails")
-        .select("*, email_analyses(*)")
-        .eq("gmail_account_email", gmail_account_email)
-        .eq("in_inbox", True)
-    )
-    if start_ms is not None:
-        query = query.gte("internal_date", start_ms)
-    if end_ms is not None:
-        query = query.lt("internal_date", end_ms)
-    if cursor_internal_date is not None:
-        query = query.lte("internal_date", cursor_internal_date)
-
-    rows = (
-        query.order("internal_date", desc=True)
-        .limit(fetch_limit)
-        .execute()
-        .data
-        or []
-    )
 
     conversations: list[dict] = []
     seen_threads: set[str] = set()
     skip_until_past_cursor = cursor_internal_date is not None
+    offset = 0
+    scanned = 0
 
-    for row in rows:
-        labels = row.get("label_ids") or []
-        if not message_matches_category(labels, category):
-            continue
-
-        thread_id = row.get("gmail_thread_id") or row.get("gmail_message_id")
-        internal_date = row.get("internal_date") or 0
-
-        if skip_until_past_cursor:
-            if (
-                internal_date == cursor_internal_date
-                and thread_id == cursor_thread_id
-            ):
-                skip_until_past_cursor = False
-            continue
-
-        if thread_id in seen_threads:
-            continue
-        seen_threads.add(thread_id)
-
-        analysis = _first_analysis(row)
-        conversations.append(
-            {
-                "thread_id": thread_id,
-                "latest_email_id": row.get("id"),
-                "gmail_message_id": row.get("gmail_message_id"),
-                "subject": row.get("subject"),
-                "sender": row.get("sender"),
-                "snippet": row.get("snippet"),
-                "internal_date": internal_date,
-                "received_at": row.get("received_at"),
-                "label_ids": labels,
-                "analysis_status": row.get("analysis_status"),
-                "email_analyses": analysis,
-                "message_count": 1,
-            }
+    while len(conversations) < limit and scanned < max_scan_rows:
+        query = (
+            client.table("emails")
+            .select("*, email_analyses(*)")
+            .eq("gmail_account_email", gmail_account_email)
+            .eq("in_inbox", True)
         )
-        if len(conversations) >= limit:
+        if start_ms is not None:
+            query = query.gte("internal_date", start_ms)
+        if end_ms is not None:
+            query = query.lt("internal_date", end_ms)
+        if cursor_internal_date is not None:
+            query = query.lte("internal_date", cursor_internal_date)
+
+        rows = (
+            query.order("internal_date", desc=True)
+            .range(offset, offset + scan_batch - 1)
+            .execute()
+            .data
+            or []
+        )
+        if not rows:
+            break
+
+        offset += len(rows)
+        scanned += len(rows)
+
+        for row in rows:
+            labels = row.get("label_ids") or []
+            thread_id = row.get("gmail_thread_id") or row.get("gmail_message_id")
+            internal_date = row.get("internal_date") or 0
+
+            if skip_until_past_cursor:
+                if (
+                    internal_date == cursor_internal_date
+                    and thread_id == cursor_thread_id
+                ):
+                    skip_until_past_cursor = False
+                continue
+
+            if not message_matches_category(labels, category):
+                continue
+
+            if thread_id in seen_threads:
+                continue
+            seen_threads.add(thread_id)
+
+            analysis = _first_analysis(row)
+            conversations.append(
+                {
+                    "thread_id": thread_id,
+                    "latest_email_id": row.get("id"),
+                    "gmail_message_id": row.get("gmail_message_id"),
+                    "subject": row.get("subject"),
+                    "sender": row.get("sender"),
+                    "snippet": row.get("snippet"),
+                    "internal_date": internal_date,
+                    "received_at": row.get("received_at"),
+                    "label_ids": labels,
+                    "analysis_status": row.get("analysis_status"),
+                    "email_analyses": analysis,
+                    "message_count": 1,
+                }
+            )
+            if len(conversations) >= limit:
+                break
+
+        if len(rows) < scan_batch:
             break
 
     # Fill message_count for returned threads (best-effort).

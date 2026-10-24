@@ -554,7 +554,7 @@ def _parse_optional_iso_date(value: str | None, *, field: str) -> str | None:
 
 @app.get("/db/conversations")
 def get_conversations(
-    category: str = "primary",
+    category: str = "inbox",
     limit: int = 20,
     cursor_internal_date: int | None = None,
     cursor_thread_id: str | None = None,
@@ -564,13 +564,13 @@ def get_conversations(
     """
     Gmail-style conversation list (newest thread activity first).
 
-    Default category=primary (INBOX + CATEGORY_PERSONAL).
-    Other values: promotions, social, inbox (all INBOX).
+    Default category=inbox (all INBOX, matching Gmail Inbox).
+    Other values: primary, updates, promotions, social, forums.
 
     Optional date_from / date_to (YYYY-MM-DD) filter threads with message
     activity in that inclusive local-calendar range (BRIEFING_TIMEZONE).
     """
-    allowed = {"primary", "promotions", "social", "inbox"}
+    allowed = {"primary", "promotions", "social", "inbox", "updates", "forums"}
     if category not in allowed:
         raise HTTPException(
             status_code=422,

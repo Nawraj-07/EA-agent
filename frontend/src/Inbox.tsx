@@ -7,7 +7,13 @@ import { API } from "./api";
 const AUTO_REFRESH_MS = 60_000;
 const PAGE_SIZE = 20;
 
-type InboxCategory = "primary" | "promotions" | "social" | "inbox";
+type InboxCategory =
+  | "inbox"
+  | "primary"
+  | "updates"
+  | "promotions"
+  | "social"
+  | "forums";
 
 type EmailAnalysis = {
   summary: string;
@@ -54,10 +60,11 @@ type ConversationsResponse = {
 };
 
 const CATEGORY_TABS: { id: InboxCategory; label: string }[] = [
+  { id: "inbox", label: "All Inbox" },
   { id: "primary", label: "Primary" },
+  { id: "updates", label: "Updates" },
   { id: "promotions", label: "Promotions" },
   { id: "social", label: "Social" },
-  { id: "inbox", label: "All Inbox" },
 ];
 
 function getAnalysis(email: Email | null): EmailAnalysis | null {
@@ -77,7 +84,7 @@ function formatActivity(internalDate: number | null | undefined, fallback: strin
 }
 
 export default function Inbox() {
-  const [category, setCategory] = useState<InboxCategory>("primary");
+  const [category, setCategory] = useState<InboxCategory>("inbox");
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [nextCursor, setNextCursor] = useState<ConversationsResponse["next_cursor"]>(null);
   const [selectedEmail, setSelectedEmail] = useState<Email | null>(null);

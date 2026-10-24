@@ -1,13 +1,13 @@
 :root {
-  --background: #f3efe8;
+  --background: #f4f7fb;
   --surface: #ffffff;
-  --surface-soft: #f7f3ed;
-  --primary: #1e3a5f;
-  --primary-hover: #18304f;
-  --primary-active: #13263f;
+  --surface-soft: #eaf0f8;
+  --primary: #0d2d6b;
+  --primary-hover: #082258;
+  --primary-active: #061a42;
   --text-primary: #0f172a;
   --text-muted: #64748b;
-  --border: #e8e2d9;
+  --border: #d5deeb;
 
   font-family: Inter, "Segoe UI", system-ui, -apple-system, sans-serif;
   line-height: 1.5;

@@ -1,16 +1,28 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import ChatPanel from "../ChatPanel";
-import DraftPanel from "../DraftPanel";
 import { useBriefingHistory } from "../hooks/useBriefingHistory";
 import "../Inbox.css";
 import "./Home.css";
+import EmailDetailPopup from "./EmailDetailPopup";
+import {
+  inboxCacheKey,
+  readInboxCache,
+  readLastInboxCache,
+  writeInboxCache,
+} from "./inboxCache";
 import ProfileChip from "./ProfileChip";
 import { API } from "../api";
 const AUTO_REFRESH_MS = 60_000;
 const PAGE_SIZE = 20;
 
-type InboxCategory = "primary" | "promotions" | "social" | "inbox";
+type InboxCategory =
+  | "inbox"
+  | "primary"
+  | "updates"
+  | "promotions"
+  | "social"
+  | "forums";
 
 type EmailAnalysis = {
   summary: string;
@@ -53,10 +65,11 @@ type ConversationsResponse = {
 };
 
 const CATEGORY_TABS: { id: InboxCategory; label: string }[] = [
+  { id: "inbox", label: "All Inbox" },
   { id: "primary", label: "Primary" },
+  { id: "updates", label: "Updates" },
   { id: "promotions", label: "Promotions" },
   { id: "social", label: "Social" },
-  { id: "inbox", label: "All Inbox" },
 ];
 
 const SUGGESTIONS = [
@@ -97,6 +110,12 @@ function formatDayLabel(isoDate: string): { weekday: string; day: string } {
   };
 }
 
+function extractDetail(data: unknown): string | null {
+  if (!data || typeof data !== "object") return null;
+  const detail = (data as { detail?: unknown }).detail;
+  return typeof detail === "string" ? detail : null;
+}
+
 function senderInitial(sender: string | null | undefined): string {
   if (!sender) return "?";
   const name = sender.replace(/<.*>/, "").trim();
@@ -133,19 +152,31 @@ export default function HomePage() {
     reload: reloadBriefing,
   } = useBriefingHistory();
 
-  const [category, setCategory] = useState<InboxCategory>("primary");
-  const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [nextCursor, setNextCursor] = useState<ConversationsResponse["next_cursor"]>(
-    null
+  const [category, setCategory] = useState<InboxCategory>(() => {
+    const last = readLastInboxCache<Conversation>()?.key.category;
+    return CATEGORY_TABS.some((tab) => tab.id === last)
+      ? (last as InboxCategory)
+      : "inbox";
+  });
+  const [conversations, setConversations] = useState<Conversation[]>(
+    () => readLastInboxCache<Conversation>()?.conversations ?? []
   );
+  const [nextCursor, setNextCursor] = useState<
+    ConversationsResponse["next_cursor"]
+  >(() => readLastInboxCache<Conversation>()?.nextCursor ?? null);
   const [selectedEmail, setSelectedEmail] = useState<Email | null>(null);
   const [threadMessages, setThreadMessages] = useState<Email[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [detailOpen, setDetailOpen] = useState(false);
+  const [loading, setLoading] = useState(
+    () => !(readLastInboxCache<Conversation>()?.conversations.length)
+  );
   const [refreshing, setRefreshing] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
   const [error, setError] = useState("");
   const [detailError, setDetailError] = useState("");
+  const [generatingBriefing, setGeneratingBriefing] = useState(false);
+  const [briefingActionError, setBriefingActionError] = useState("");
   const dateFrom = visibleRange?.startDate ?? null;
   const dateTo = visibleRange?.endDate ?? null;
 
@@ -177,11 +208,15 @@ export default function HomePage() {
       from?: string | null;
       to?: string | null;
     }) => {
-      const silent = options?.silent ?? false;
       const append = options?.append ?? false;
       const cat = options?.cat ?? category;
       const from = options?.from !== undefined ? options.from : dateFrom;
       const to = options?.to !== undefined ? options.to : dateTo;
+      const key = inboxCacheKey(cat, from, to);
+      const cached = readInboxCache<Conversation>(key);
+      const silent =
+        (options?.silent ?? false) ||
+        Boolean(cached?.conversations.length);
 
       try {
         if (append) setLoadingMore(true);
@@ -217,10 +252,19 @@ export default function HomePage() {
         if (!Array.isArray(data.conversations)) {
           throw new Error("Unexpected API response");
         }
-        setConversations((prev) =>
-          append ? [...prev, ...data.conversations] : data.conversations
-        );
-        setNextCursor(data.next_cursor ?? null);
+        const nextCursorValue = data.next_cursor ?? null;
+        setConversations((prev) => {
+          const next = append
+            ? [...prev, ...data.conversations]
+            : data.conversations;
+          writeInboxCache({
+            key,
+            conversations: next,
+            nextCursor: nextCursorValue,
+          });
+          return next;
+        });
+        setNextCursor(nextCursorValue);
       } catch (err) {
         setError(err instanceof Error ? err.message : "Something went wrong");
       } finally {
@@ -234,10 +278,23 @@ export default function HomePage() {
 
   useEffect(() => {
     if (!rangeReady) return;
-    setNextCursor(null);
-    setSelectedEmail(null);
-    setThreadMessages([]);
-    void loadConversations({ cat: category, from: dateFrom, to: dateTo });
+    const key = inboxCacheKey(category, dateFrom, dateTo);
+    const cached = readInboxCache<Conversation>(key);
+    if (cached?.conversations.length) {
+      setConversations(cached.conversations);
+      setNextCursor(cached.nextCursor);
+      setLoading(false);
+    } else {
+      setConversations([]);
+      setNextCursor(null);
+      setLoading(true);
+    }
+    void loadConversations({
+      cat: category,
+      from: dateFrom,
+      to: dateTo,
+      silent: Boolean(cached?.conversations.length),
+    });
   }, [category, rangeReady, dateFrom, dateTo, loadConversations]);
 
   useEffect(() => {
@@ -246,6 +303,44 @@ export default function HomePage() {
     }, AUTO_REFRESH_MS);
     return () => window.clearInterval(timer);
   }, [loadConversations]);
+
+  async function generateBriefing() {
+    if (generatingBriefing) return;
+
+    const dateForGenerate = selectedDate || history?.today;
+    if (!dateForGenerate) {
+      setBriefingActionError("Select a date before generating a briefing.");
+      return;
+    }
+
+    setGeneratingBriefing(true);
+    setBriefingActionError("");
+    setError("");
+
+    try {
+      const params = new URLSearchParams({ date: dateForGenerate });
+      const response = await fetch(
+        `${API}/internal/briefing-now?${params.toString()}`,
+        { method: "POST" }
+      );
+      const data = await response.json().catch(() => null);
+
+      if (!response.ok) {
+        throw new Error(
+          extractDetail(data) ||
+            `Briefing generation failed (${response.status})`
+        );
+      }
+
+      await reloadBriefing(dateForGenerate);
+    } catch (err) {
+      setBriefingActionError(
+        err instanceof Error ? err.message : "Briefing generation failed"
+      );
+    } finally {
+      setGeneratingBriefing(false);
+    }
+  }
 
   async function refreshInbox() {
     setRefreshing(true);
@@ -271,6 +366,7 @@ export default function HomePage() {
   }
 
   async function selectConversation(conv: Conversation) {
+    setDetailOpen(true);
     setDetailLoading(true);
     setDetailError("");
     setSelectedEmail(null);
@@ -312,6 +408,7 @@ export default function HomePage() {
   }
 
   async function openEmailById(emailId: string) {
+    setDetailOpen(true);
     setDetailLoading(true);
     setDetailError("");
     try {
@@ -328,6 +425,10 @@ export default function HomePage() {
       setDetailLoading(false);
     }
   }
+
+  const closeDetail = useCallback(() => {
+    setDetailOpen(false);
+  }, []);
 
   const analysis = getAnalysis(selectedEmail);
   const analysisPending =
@@ -380,9 +481,6 @@ export default function HomePage() {
     return items;
   }, [briefingContent]);
 
-  const visibleBriefingItems = briefingItems.slice(0, 3);
-  const moreBriefingCount = Math.max(0, briefingItems.length - 3);
-
   return (
     <div className="home-page">
       <header className="home-hero">
@@ -393,8 +491,8 @@ export default function HomePage() {
                 className="home-brand-icon"
                 src="/buddy-logo.jpg"
                 alt=""
-                width={56}
-                height={56}
+                width={44}
+                height={44}
               />
               <div className="home-brand-text">
                 <h1 className="home-logo" aria-label="büddy">
@@ -510,72 +608,12 @@ export default function HomePage() {
         </div>
       </header>
 
-      <section className="home-briefing-card" aria-label="Daily Briefing">
-        <div className="home-briefing-card-head">
-          <div className="home-briefing-title">
-            <div className="home-briefing-icon" aria-hidden>
-              ✓
-            </div>
-            <div>
-              <h2>Daily Briefing</h2>
-              <p>
-                {briefingLoading && !selectedDate
-                  ? "Loading…"
-                  : formatBriefingSubtitle(
-                      selectedDate || history?.today || "",
-                      briefingContent?.headline
-                    )}
-              </p>
-            </div>
-          </div>
-          <Link className="home-view-all" to="/briefings">
-            View all →
-          </Link>
-        </div>
-        {briefingLoading && briefingItems.length === 0 ? (
-          <p className="home-empty" style={{ padding: "8px 0" }}>
-            Loading briefing…
-          </p>
-        ) : briefingItems.length === 0 ? (
-          <p className="home-empty" style={{ padding: "8px 0" }}>
-            No briefing for this day yet. Open View all to generate one.
-          </p>
-        ) : (
-          <ul className="home-briefing-items">
-            {visibleBriefingItems.map((item) => (
-              <li key={`${item.kind}-${item.text}`} className="home-briefing-item">
-                <span
-                  className={`home-briefing-item-icon ${
-                    item.kind === "deadline"
-                      ? "deadline"
-                      : item.kind === "follow"
-                        ? "follow"
-                        : ""
-                  }`}
-                  aria-hidden
-                >
-                  {item.kind === "deadline"
-                    ? "◎"
-                    : item.kind === "follow"
-                      ? "⏱"
-                      : "✓"}
-                </span>
-                <span className="home-briefing-item-text">{item.text}</span>
-              </li>
-            ))}
-            {moreBriefingCount > 0 && (
-              <li className="home-briefing-more">
-                +{moreBriefingCount} more upcoming items
-              </li>
-            )}
-          </ul>
-        )}
-      </section>
-
-      {(error || briefingError) && (
+      {(error || briefingError || briefingActionError) && (
         <div className="home-error" role="alert">
-          {error || briefingError}{" "}
-          {/gmail|oauth|reconnect/i.test(error || briefingError) ? (
+          {error || briefingError || briefingActionError}{" "}
+          {/gmail|oauth|reconnect/i.test(
+            error || briefingError || briefingActionError
+          ) ? (
             <a href={`${API}/auth/google`}>Connect Gmail</a>
           ) : null}
         </div>
@@ -589,8 +627,9 @@ export default function HomePage() {
               <p>
                 {conversations.length} conversations in selected period
                 {visibleRange
-                  ? ` (${visibleRange.startDate} → ${visibleRange.endDate})`
-                  : ""}
+                  ? ` (${visibleRange.startDate} → ${visibleRange.endDate}).`
+                  : "."}{" "}
+                Tap a mail for AI summary.
               </p>
             </div>
           </div>
@@ -607,6 +646,7 @@ export default function HomePage() {
                   setCategory(tab.id);
                   setSelectedEmail(null);
                   setThreadMessages([]);
+                  setDetailOpen(false);
                 }}
               >
                 {tab.label}
@@ -614,14 +654,7 @@ export default function HomePage() {
             ))}
           </div>
 
-          {!rangeReady || loading ? (
-            <p className="home-empty">Loading conversations…</p>
-          ) : conversations.length === 0 ? (
-            <p className="home-empty">
-              No conversations in this date range. Refresh inbox to sync more
-              mail if local data is incomplete.
-            </p>
-          ) : (
+          {conversations.length > 0 ? (
             <>
               {conversations.map((conv) => {
                 const imp = (
@@ -678,148 +711,142 @@ export default function HomePage() {
                 </button>
               )}
             </>
+          ) : !rangeReady || loading ? (
+            <p className="home-empty">Loading conversations…</p>
+          ) : (
+            <p className="home-empty">
+              No conversations in this date range. Refresh inbox to sync more
+              mail if local data is incomplete.
+            </p>
           )}
         </section>
 
-        <section className="home-col" aria-label="Email details">
-          <div className="home-col-head">
-            <div>
-              <h2>Email</h2>
-              <p>Selected conversation details</p>
-            </div>
-          </div>
-
-          {detailLoading ? (
-            <p className="home-empty">Loading email details…</p>
-          ) : detailError ? (
-            <p className="home-error">{detailError}</p>
-          ) : !selectedEmail ? (
-            <div className="home-empty-state">
-              <div className="home-empty-illus" aria-hidden>
-                ✉
+        <section className="home-briefing-card home-briefing-col" aria-label="Daily Briefing">
+          <div className="home-briefing-card-head">
+            <div className="home-briefing-title">
+              <div className="home-briefing-icon" aria-hidden>
+                ✓
               </div>
-              <h3>Select a conversation</h3>
-              <p>
-                Choose an email from the inbox to see summary, insights and
-                suggested actions.
-              </p>
-            </div>
-          ) : (
-            <>
-              <h2 style={{ fontSize: 18, marginBottom: 10 }}>
-                {selectedEmail.subject || "No Subject"}
-              </h2>
-              <p className="home-detail-meta">
-                <strong>From:</strong> {selectedEmail.sender || "Unknown"}
-              </p>
-              <p className="home-detail-meta">
-                <strong>Date:</strong>{" "}
-                {formatTime(
-                  selectedEmail.internal_date,
-                  selectedEmail.received_at
-                )}
-              </p>
-
-              {threadMessages.length > 1 && (
-                <div style={{ margin: "12px 0" }}>
-                  <p className="home-detail-meta">
-                    <strong>Thread</strong> ({threadMessages.length})
-                  </p>
-                  {threadMessages.map((msg) => (
-                    <button
-                      key={msg.id}
-                      type="button"
-                      className={`home-conv${
-                        selectedEmail.id === msg.id ? " active" : ""
-                      }`}
-                      onClick={() => setSelectedEmail(msg)}
-                    >
-                      {msg.sender || "Unknown"} —{" "}
-                      {formatTime(msg.internal_date, msg.received_at)}
-                    </button>
-                  ))}
-                </div>
-              )}
-
-              <div className="home-ai-box">
-                <h3>
-                  <span aria-hidden>✦</span> AI Summary
-                  {analysis?.importance && (
-                    <span
-                      className={`home-badge ${analysis.importance.toLowerCase()}`}
-                      style={{ marginLeft: 8 }}
-                    >
-                      {analysis.importance}
-                    </span>
-                  )}
-                </h3>
+              <div>
+                <h2>Daily Briefing</h2>
                 <p>
-                  {analysis?.summary ||
-                    (analysisFailed
-                      ? "Analysis failed. It will be retried on the next sync."
-                      : "Analyzing this email…")}
+                  {briefingLoading && !selectedDate
+                    ? "Loading…"
+                    : formatBriefingSubtitle(
+                        selectedDate || history?.today || "",
+                        briefingContent?.headline
+                      )}
                 </p>
               </div>
-
-              <div className="home-analysis-grid">
-                <div>
-                  Category
-                  <strong>
-                    {analysis?.category || (analysisPending ? "…" : "N/A")}
-                  </strong>
-                </div>
-                <div>
-                  Importance
-                  <strong>
-                    {analysis?.importance || (analysisPending ? "…" : "N/A")}
-                  </strong>
-                </div>
-                <div>
-                  Action required
-                  <strong>
-                    {analysis
-                      ? analysis.action_required
-                        ? "Yes"
-                        : "No"
-                      : analysisPending
-                        ? "…"
-                        : "N/A"}
-                  </strong>
-                </div>
-              </div>
-
-              <p className="home-detail-meta" style={{ marginBottom: 12 }}>
-                {selectedEmail.snippet || "No preview available"}
-              </p>
-
-              <DraftPanel
-                key={selectedEmail.id}
-                emailId={selectedEmail.id}
-                sender={selectedEmail.sender}
-              />
-            </>
-          )}
-        </section>
-
-        <section className="home-col home-ask-col" aria-label="Ask My Inbox">
-          <div className="home-col-head">
-            <div>
-              <h2>Ask My Inbox</h2>
-              <p>
-                {selectedEmail
-                  ? "Asking about the selected email (follow-ups supported)"
-                  : "Search across saved mail by sender, date, keywords, or importance"}
-              </p>
+            </div>
+            <div className="home-briefing-actions">
+              <button
+                type="button"
+                className="home-briefing-btn"
+                onClick={() => void generateBriefing()}
+                disabled={
+                  briefingLoading || generatingBriefing || !selectedDate
+                }
+              >
+                {generatingBriefing
+                  ? "Generating…"
+                  : selectedDay?.has_briefing
+                    ? "Regenerate"
+                    : "Generate"}
+              </button>
+              <Link
+                className="home-view-all"
+                to="/briefings"
+                aria-label="View all briefings"
+                title="View all briefings"
+              >
+                <svg
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  aria-hidden
+                >
+                  <path
+                    d="M5 12h14M13 6l6 6-6 6"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              </Link>
             </div>
           </div>
-          <ChatPanel
-            embedded
-            suggestions={SUGGESTIONS}
-            emailId={selectedEmail?.id}
-            onOpenEmail={(id) => void openEmailById(id)}
-          />
+          {briefingLoading && briefingItems.length === 0 ? (
+            <p className="home-empty" style={{ padding: "8px 0" }}>
+              Loading briefing…
+            </p>
+          ) : briefingItems.length === 0 ? (
+            <p className="home-empty" style={{ padding: "8px 0" }}>
+              No briefing for this day yet. Use Generate, or wait for the
+              scheduled job.
+            </p>
+          ) : (
+            <ul className="home-briefing-items">
+              {briefingItems.map((item) => (
+                <li key={`${item.kind}-${item.text}`} className="home-briefing-item">
+                  <span
+                    className={`home-briefing-item-icon ${
+                      item.kind === "deadline"
+                        ? "deadline"
+                        : item.kind === "follow"
+                          ? "follow"
+                          : ""
+                    }`}
+                    aria-hidden
+                  >
+                    {item.kind === "deadline"
+                      ? "◎"
+                      : item.kind === "follow"
+                        ? "⏱"
+                        : "✓"}
+                  </span>
+                  <span className="home-briefing-item-text">{item.text}</span>
+                </li>
+              ))}
+            </ul>
+          )}
         </section>
       </div>
+
+      <section className="home-buddy" aria-label="AI buddy">
+        <div className="home-col-head">
+          <div>
+            <h2>AI buddy</h2>
+            <p>
+              {selectedEmail
+                ? "Asking about the selected email (follow-ups supported)"
+                : "Search across saved mail by sender, date, keywords, or importance"}
+            </p>
+          </div>
+        </div>
+        <ChatPanel
+          embedded
+          suggestions={SUGGESTIONS}
+          emailId={selectedEmail?.id}
+          onOpenEmail={(id) => void openEmailById(id)}
+        />
+      </section>
+
+      <EmailDetailPopup
+        open={detailOpen}
+        onClose={closeDetail}
+        selectedEmail={selectedEmail}
+        threadMessages={threadMessages}
+        onSelectThreadMessage={setSelectedEmail}
+        detailLoading={detailLoading}
+        detailError={detailError}
+        analysis={analysis}
+        analysisPending={analysisPending}
+        analysisFailed={analysisFailed}
+        formatTime={formatTime}
+      />
     </div>
   );
 }

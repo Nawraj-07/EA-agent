@@ -323,7 +323,11 @@ CATEGORY_LABELS = {
     "primary": "CATEGORY_PERSONAL",
     "promotions": "CATEGORY_PROMOTIONS",
     "social": "CATEGORY_SOCIAL",
+    "updates": "CATEGORY_UPDATES",
+    "forums": "CATEGORY_FORUMS",
 }
+
+GMAIL_TAB_LABELS = frozenset(CATEGORY_LABELS.values())
 
 
 def message_matches_category(label_ids: list[str] | None, category: str) -> bool:
@@ -332,7 +336,10 @@ def message_matches_category(label_ids: list[str] | None, category: str) -> bool
         return False
     if category == "inbox":
         return True
+    if category == "primary":
+        other_tabs = GMAIL_TAB_LABELS - {"CATEGORY_PERSONAL"}
+        return "CATEGORY_PERSONAL" in labels or labels.isdisjoint(other_tabs)
     required = CATEGORY_LABELS.get(category)
     if not required:
-        return category == "primary" and "CATEGORY_PERSONAL" in labels
+        return False
     return required in labels

@@ -96,7 +96,7 @@ export function useBriefingHistory() {
     setSelectedDate,
     selectedDay,
     visibleRange,
-    rangeReady: !loading && (visibleRange !== null || error !== ""),
+    rangeReady: visibleRange !== null || (!loading && error !== ""),
     loading,
     error,
     reload: load,

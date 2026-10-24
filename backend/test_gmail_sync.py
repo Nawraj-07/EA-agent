@@ -14,11 +14,17 @@ from gmail_sync import (
 def test_message_matches_category_primary_and_inbox():
     primary = ["INBOX", "CATEGORY_PERSONAL", "UNREAD"]
     promo = ["INBOX", "CATEGORY_PROMOTIONS"]
+    updates = ["INBOX", "CATEGORY_UPDATES", "UNREAD"]
+    uncategorized = ["INBOX", "UNREAD"]
     archived = ["CATEGORY_PERSONAL"]
 
     assert message_matches_category(primary, "primary") is True
+    assert message_matches_category(uncategorized, "primary") is True
     assert message_matches_category(promo, "primary") is False
+    assert message_matches_category(updates, "primary") is False
     assert message_matches_category(promo, "promotions") is True
+    assert message_matches_category(updates, "updates") is True
+    assert message_matches_category(updates, "inbox") is True
     assert message_matches_category(primary, "inbox") is True
     assert message_matches_category(archived, "inbox") is False
 

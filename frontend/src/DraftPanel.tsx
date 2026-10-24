@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { API } from "./api";
 
 type Draft = {
@@ -13,6 +13,8 @@ type Draft = {
 type DraftPanelProps = {
   emailId: string;
   sender?: string | null;
+  embedded?: boolean;
+  autoGenerateToken?: number;
 };
 
 function isNoReplyBody(body: string | undefined | null): boolean {
@@ -63,7 +65,12 @@ function formatStatus(status: string | undefined): string {
   return "PENDING";
 }
 
-export default function DraftPanel({ emailId, sender }: DraftPanelProps) {
+export default function DraftPanel({
+  emailId,
+  sender,
+  embedded = false,
+  autoGenerateToken = 0,
+}: DraftPanelProps) {
   const [draft, setDraft] = useState<Draft | null>(null);
   const [draftBody, setDraftBody] = useState("");
   const [loading, setLoading] = useState(false);
@@ -134,6 +141,19 @@ export default function DraftPanel({ emailId, sender }: DraftPanelProps) {
       setLoading(false);
     }
   }
+
+  const generateDraftRef = useRef(generateDraft);
+  generateDraftRef.current = generateDraft;
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
+  const busyRef = useRef(busy);
+  busyRef.current = busy;
+
+  useEffect(() => {
+    if (!autoGenerateToken) return;
+    if (draftRef.current || busyRef.current) return;
+    void generateDraftRef.current();
+  }, [autoGenerateToken]);
 
   async function patchDraft(payload: { body?: string; status?: string }) {
     if (!draft || busy) return;
@@ -256,8 +276,8 @@ export default function DraftPanel({ emailId, sender }: DraftPanelProps) {
   const statusClass = statusLabel.toLowerCase();
 
   return (
-    <section className="draft-panel">
-      <h3>AI Draft Reply</h3>
+    <section className={`draft-panel${embedded ? " embedded" : ""}`}>
+      {embedded ? null : <h3>AI Draft Reply</h3>}
 
       <button
         type="button"
