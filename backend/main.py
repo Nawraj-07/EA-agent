@@ -40,6 +40,14 @@ from gmail_safety import (
     assert_gmail_scopes_safe,
     get_allowed_gmail_account,
 )
+from gmail_token_store import (
+    TokenStoreError,
+    TokenStoreMissingError,
+    TokenStoreNotConfiguredError,
+    load_credentials_payload,
+    persist_credentials,
+)
+from token_crypto import TokenCryptoError
 from gmail_sync import get_connected_profile, get_profile_email
 from html import unescape
 from pathlib import Path
@@ -162,17 +170,14 @@ def create_google_flow() -> Flow:
 
 # ========== SECTION 5A: SAVE TOKENS ==========
 def save_credentials(credentials: Credentials) -> None:
-    # For local development only: this file contains sensitive OAuth secrets.
-    TOKEN_PATH.write_text(credentials.to_json(), encoding='utf-8')
+    persist_credentials(credentials, token_path=TOKEN_PATH)
 
 
 # ========== SECTION 5B: LOAD & REFRESH TOKENS ==========
 def load_gmail_credentials() -> Credentials:
-    if not TOKEN_PATH.is_file():
-        raise HTTPException(status_code=401, detail='Gmail not connected. Visit /auth/google first.')
-
     try:
-        token_data = json.loads(TOKEN_PATH.read_text(encoding='utf-8'))
+        token_json = load_credentials_payload(token_path=TOKEN_PATH)
+        token_data = json.loads(token_json)
         stored_scopes = token_data.get('scopes') or SCOPES
         assert_gmail_scopes_safe(stored_scopes)
         # Refresh with granted scopes only. Extra identity scopes require reconnect.
@@ -181,9 +186,26 @@ def load_gmail_credentials() -> Credentials:
             scopes=stored_scopes,
         )
         assert_credentials_safe(creds)
+    except TokenStoreNotConfiguredError as exc:
+        logger.warning('Gmail token store is not configured: %s', type(exc).__name__)
+        raise HTTPException(
+            status_code=503,
+            detail='Gmail token store is not configured.',
+        ) from exc
+    except TokenStoreMissingError as exc:
+        raise HTTPException(
+            status_code=401,
+            detail='Gmail not connected. Visit /auth/google first.',
+        ) from exc
     except GmailAccessDenied as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+    except TokenCryptoError as exc:
+        logger.warning('Could not decrypt stored Gmail credentials: %s', type(exc).__name__)
+        raise HTTPException(
+            status_code=401,
+            detail='Saved Gmail credentials are invalid. Reconnect at /auth/google.',
+        ) from exc
+    except (TokenStoreError, OSError, ValueError, KeyError, TypeError) as exc:
         logger.warning('Could not load stored Gmail credentials: %s', type(exc).__name__)
         raise HTTPException(status_code=401, detail='Saved Gmail credentials are invalid. Reconnect at /auth/google.') from exc
 
@@ -193,7 +215,7 @@ def load_gmail_credentials() -> Credentials:
         try:
             creds.refresh(GoogleRequest())
             save_credentials(creds)
-        except (RefreshError, OSError, ValueError) as exc:
+        except (RefreshError, OSError, ValueError, TokenStoreError, TokenCryptoError) as exc:
             logger.warning('Could not refresh Gmail credentials: %s', type(exc).__name__)
             raise HTTPException(status_code=401, detail='Gmail token refresh failed. Reconnect at /auth/google.') from exc
 

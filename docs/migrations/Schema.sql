@@ -86,8 +86,17 @@ CREATE TABLE IF NOT EXISTS public.gmail_sync_state (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS public.gmail_oauth_credentials (
+    gmail_account_email TEXT PRIMARY KEY,
+    ciphertext TEXT NOT NULL,
+    key_version SMALLINT NOT NULL DEFAULT 1,
+    token_expiry TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 ALTER TABLE public.emails ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.email_analyses ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.drafts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.daily_briefings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.gmail_sync_state ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.gmail_oauth_credentials ENABLE ROW LEVEL SECURITY;

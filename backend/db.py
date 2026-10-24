@@ -535,6 +535,65 @@ def get_sync_state(gmail_account_email: str) -> dict | None:
     return response.data[0] if response.data else None
 
 
+def get_gmail_oauth_row(gmail_account_email: str) -> dict | None:
+    """Return the encrypted OAuth row for this mailbox, or None.
+
+    Callers must never log ciphertext or decrypted JSON.
+    """
+    account = (gmail_account_email or "").strip().lower()
+    if not account:
+        return None
+
+    client = get_supabase_client()
+    response = (
+        client.table("gmail_oauth_credentials")
+        .select(
+            "gmail_account_email,ciphertext,key_version,token_expiry,updated_at"
+        )
+        .eq("gmail_account_email", account)
+        .limit(1)
+        .execute()
+    )
+    return response.data[0] if response.data else None
+
+
+def upsert_gmail_oauth_row(
+    gmail_account_email: str,
+    *,
+    ciphertext: str,
+    key_version: int = 1,
+    token_expiry: str | None = None,
+) -> dict:
+    """Insert or replace the encrypted OAuth blob. Never log ciphertext."""
+    account = (gmail_account_email or "").strip().lower()
+    if not account:
+        raise ValueError("gmail_account_email is required")
+    if not ciphertext or not str(ciphertext).strip():
+        raise ValueError("ciphertext is required")
+
+    client = get_supabase_client()
+    row = {
+        "gmail_account_email": account,
+        "ciphertext": str(ciphertext).strip(),
+        "key_version": int(key_version),
+        "token_expiry": token_expiry,
+        "updated_at": _utcnow(),
+    }
+    result = (
+        client.table("gmail_oauth_credentials")
+        .upsert(row, on_conflict="gmail_account_email")
+        .execute()
+    )
+    if not result.data:
+        raise RuntimeError("Failed to upsert gmail_oauth_credentials")
+    return {
+        "gmail_account_email": result.data[0].get("gmail_account_email"),
+        "key_version": result.data[0].get("key_version"),
+        "token_expiry": result.data[0].get("token_expiry"),
+        "updated_at": result.data[0].get("updated_at"),
+    }
+
+
 def _count_account_rows(table: str, gmail_account_email: str) -> int:
     client = get_supabase_client()
     result = (

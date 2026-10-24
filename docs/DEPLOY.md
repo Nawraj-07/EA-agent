@@ -10,6 +10,8 @@ Use this when moving from local learning to a hosted environment.
   - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`
   - `SESSION_SECRET` (long random; regenerate for prod)
   - `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `DATABASE_URL`
+  - `GMAIL_TOKEN_ENCRYPTION_KEY` (Fernet key; backend only)
+  - `GMAIL_TOKEN_STORE=supabase` on Render
   - `FRONTEND_URL`, `BACKEND_URL`, `VITE_API_URL` (build-time for Vite)
 - [ ] `SESSION_HTTPS_ONLY=true` behind HTTPS
 - [ ] `CORS_ORIGINS` = your production frontend origin(s), comma-separated
@@ -26,6 +28,7 @@ Use this when moving from local learning to a hosted environment.
 ## 3. Database
 
 - [ ] Run [`docs/Schema.sql`](Schema.sql) (or migrations under `docs/migrations/`) on production Supabase
+- [ ] Run [`docs/migrations/2026-10-24_gmail_oauth_credentials.sql`](migrations/2026-10-24_gmail_oauth_credentials.sql) for encrypted OAuth storage
 - [ ] Confirm RLS stays enabled; backend uses **service_role** only
 - [ ] Confirm `drafts.status` allows `pending`, `sending`, `approved`, `rejected`, `sent`
 - [ ] Confirm `daily_briefings` table exists
@@ -37,8 +40,10 @@ Suggested: Railway, Render, Fly.io, or any Linux VM.
 - [ ] Python 3.10+, install deps from venv / `requirements` if you add one
 - [ ] Start with a **single worker** if the scheduler runs in-process:
   - Example: `uvicorn main:app --host 0.0.0.0 --port 8000`
-- [ ] Persist or re-issue Gmail OAuth tokens (`token.json` is local-dev only; prefer encrypted DB storage later)
-- [ ] Health check: `GET /health`
+- [ ] Do **not** upload `token.json` to Render. Store encrypted credentials in Supabase (`GMAIL_TOKEN_STORE=supabase`)
+- [ ] Generate `GMAIL_TOKEN_ENCRYPTION_KEY` locally and set it only in Render env (never GitHub)
+- [ ] After the SQL migration, run `python migrate_gmail_token.py --confirm` **locally** once
+- [ ] Health check: `GET /health` and `GET /auth/me` without visiting `/auth/google`
 
 ## 5. Frontend host
 
