@@ -215,6 +215,26 @@ def test_unknown_mode_defaults_to_auto():
         assert gmail_token_store.get_token_store_mode() == "auto"
 
 
+def test_persist_preserves_refresh_token_if_new_payload_omits_it():
+    with TemporaryDirectory() as folder:
+        token_path = Path(folder) / "fake-token.json"
+        with patch.dict("os.environ", _env(None, "file"), clear=False):
+            gmail_token_store.persist_credentials(_fake_creds(), token_path=token_path)
+            stale = Credentials(
+                token="ya29.fake-access-token",
+                refresh_token=None,
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id="fake-client-id.apps.googleusercontent.com",
+                client_secret="fake-client-secret",
+                scopes=FAKE_SCOPES,
+            )
+            gmail_token_store.persist_credentials(stale, token_path=token_path)
+            loaded = json.loads(
+                gmail_token_store.load_credentials_payload(token_path=token_path)
+            )
+        assert loaded["refresh_token"] == "1//fake-refresh-token"
+
+
 def test_lock_is_reentrant():
     with TemporaryDirectory() as folder:
         token_path = Path(folder) / "fake-token.json"
@@ -242,5 +262,6 @@ if __name__ == "__main__":
     test_auto_with_supabase_does_not_create_file()
     test_auto_dual_writes_existing_file()
     test_unknown_mode_defaults_to_auto()
+    test_persist_preserves_refresh_token_if_new_payload_omits_it()
     test_lock_is_reentrant()
     print("All gmail token store tests passed.")

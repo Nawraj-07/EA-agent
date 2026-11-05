@@ -6,9 +6,10 @@ services:
     env_file:
       - ./.env
     volumes:
-      - ./backend/token.json:/app/token.json
+      # Mount source so WhatsApp/client fixes apply without image rebuild.
+      - ./backend:/app
       - buddy_auth:/app/auth_data
-    restart: unless-stopped
+    restart: "no"
 
   frontend:
     build: ./frontend

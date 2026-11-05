@@ -68,6 +68,23 @@ def test_list_history_expired_raises():
             assert False, "expected HistoryExpiredError"
         except HistoryExpiredError:
             pass
+    assert fake_request.execute.call_count == 1
+
+
+def test_backoff_does_not_retry_unauthorized():
+    from googleapiclient.errors import HttpError
+
+    fake_resp = MagicMock()
+    fake_resp.status = 401
+    http_error = HttpError(fake_resp, b"unauthorized")
+    fake_request = MagicMock()
+    fake_request.execute.side_effect = http_error
+    try:
+        gmail_sync._execute_with_backoff(fake_request)
+        assert False, "expected HttpError"
+    except HttpError:
+        pass
+    assert fake_request.execute.call_count == 1
 
 
 def test_conversation_grouping_order_by_internal_date():
@@ -153,6 +170,9 @@ def test_upsert_idempotent_conflict_key():
             return self
 
         def eq(self, *_a, **_k):
+            return self
+
+        def limit(self, *_a, **_k):
             return self
 
         def maybe_single(self):
@@ -242,6 +262,7 @@ if __name__ == "__main__":
     test_message_matches_category_primary_and_inbox()
     test_parse_history_archive_and_add()
     test_list_history_expired_raises()
+    test_backoff_does_not_retry_unauthorized()
     test_conversation_grouping_order_by_internal_date()
     test_upsert_idempotent_conflict_key()
     test_get_google_userinfo_skipped_without_scope()

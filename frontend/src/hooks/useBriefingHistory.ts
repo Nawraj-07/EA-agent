@@ -1,13 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { API } from "../api";
+import type { BriefingContent } from "../home/briefingTypes";
 
-export type BriefingContent = {
-  headline?: string;
-  highlights?: string[];
-  deadlines?: string[];
-  action_items?: string[];
-  notes?: string;
-};
+export type { BriefingContent };
 
 export type Briefing = {
   id: string;
@@ -28,10 +23,50 @@ export type BriefingHistory = {
   days: HistoryDay[];
 };
 
+type BriefingHistorySnapshot = {
+  history: BriefingHistory;
+  homeSelectedDate: string;
+};
+
+let briefingHistorySnapshot: BriefingHistorySnapshot | null = null;
+
+export function readBriefingHistoryCache(): BriefingHistorySnapshot | null {
+  return briefingHistorySnapshot;
+}
+
+export function writeBriefingHistoryCache(
+  history: BriefingHistory,
+  homeSelectedDate?: string
+) {
+  const previous = briefingHistorySnapshot?.homeSelectedDate ?? "";
+  const kept =
+    homeSelectedDate ??
+    (previous && history.days.some((day) => day.date === previous)
+      ? previous
+      : "");
+  briefingHistorySnapshot = {
+    history,
+    homeSelectedDate: kept,
+  };
+}
+
+export function rememberBriefingHomeDate(date: string) {
+  if (!briefingHistorySnapshot) return;
+  briefingHistorySnapshot = {
+    ...briefingHistorySnapshot,
+    homeSelectedDate: date,
+  };
+}
+
 export function useBriefingHistory() {
-  const [history, setHistory] = useState<BriefingHistory | null>(null);
-  const [selectedDate, setSelectedDate] = useState("");
-  const [loading, setLoading] = useState(true);
+  const cached = readBriefingHistoryCache();
+  const [history, setHistory] = useState<BriefingHistory | null>(
+    () => cached?.history ?? null
+  );
+  const [selectedDate, setSelectedDateState] = useState(
+    () => cached?.homeSelectedDate || cached?.history.today || ""
+  );
+  const [loading, setLoading] = useState(() => readBriefingHistoryCache() == null);
   const [error, setError] = useState("");
 
   const load = useCallback(async (preferDate?: string) => {
@@ -54,18 +89,20 @@ export function useBriefingHistory() {
       }
       const payload = data as BriefingHistory;
       const days = Array.isArray(payload.days) ? payload.days : [];
-      setHistory({
+      const nextHistory = {
         timezone: payload.timezone || "",
         today: payload.today || "",
         days,
-      });
+      };
+      setHistory(nextHistory);
       const preferred =
         preferDate && days.some((d) => d.date === preferDate)
           ? preferDate
           : payload.today && days.some((d) => d.date === payload.today)
             ? payload.today
             : days[days.length - 1]?.date || "";
-      setSelectedDate(preferred);
+      setSelectedDateState(preferred);
+      writeBriefingHistoryCache(nextHistory, preferred);
     } catch (err) {
       setHistory(null);
       setError(err instanceof Error ? err.message : "Something went wrong");
@@ -74,7 +111,13 @@ export function useBriefingHistory() {
     }
   }, []);
 
+  const setSelectedDate = useCallback((date: string) => {
+    setSelectedDateState(date);
+    rememberBriefingHomeDate(date);
+  }, []);
+
   useEffect(() => {
+    if (readBriefingHistoryCache()) return;
     void load();
   }, [load]);
 

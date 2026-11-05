@@ -1,0 +1,30 @@
+-- AI Follow-up Assistant — persistence notes (DO NOT auto-run).
+--
+-- Preferred storage: reuse public.briefing_recommendation_state
+--   (docs/migrations/2026-11-03_briefing_recommendation_state.sql)
+-- with source_type = 'followup' and metadata JSONB fields:
+--   attempt_count, waiting_hours, followup_state, followup_confidence,
+--   source_email_id, gmail_thread_id, recipient, last_outgoing_at,
+--   resolved_reason
+--
+-- Draft generation never increments attempt_count.
+-- Verified SENT / outgoing Gmail messages after the request message do.
+--
+-- Prerequisite: apply 2026-11-03_briefing_recommendation_state.sql when approved.
+-- This file intentionally contains no DDL — no additive table is required for MVP.
+--
+-- Optional future additive table (only if metadata proves insufficient):
+--
+-- CREATE TABLE IF NOT EXISTS public.briefing_followup_attempts (
+--     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+--     gmail_account_email TEXT NOT NULL,
+--     recommendation_key TEXT NOT NULL,
+--     gmail_thread_id TEXT,
+--     gmail_message_id TEXT,
+--     attempt_kind TEXT NOT NULL CHECK (attempt_kind IN ('sent_followup')),
+--     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+--     UNIQUE (gmail_account_email, gmail_message_id)
+-- );
+--
+-- Do not enable AI_FOLLOWUP_ASSISTANT_ENABLED until recommendation_state exists
+-- and endpoints are verified.

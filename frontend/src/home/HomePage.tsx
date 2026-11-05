@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import ChatPanel from "../ChatPanel";
 import { useBriefingHistory } from "../hooks/useBriefingHistory";
+import { useBriefingMode } from "../hooks/useBriefingMode";
 import "../Inbox.css";
 import "./Home.css";
 import EmailDetailPopup from "./EmailDetailPopup";
@@ -12,9 +13,15 @@ import {
   writeInboxCache,
 } from "./inboxCache";
 import ProfileChip from "./ProfileChip";
+import EmailGlanceTabs from "./EmailGlanceTabs";
+import DailyBriefingBody from "./DailyBriefingBody";
+import CatchupPanel from "./CatchupPanel";
+import EndMyDayPanel from "./EndMyDayPanel";
+import { MODE_FILTERS } from "./briefingModeUtils";
 import { API } from "../api";
 const AUTO_REFRESH_MS = 60_000;
 const PAGE_SIZE = 20;
+const autoBriefingAttempted = new Set<string>();
 
 type InboxCategory =
   | "inbox"
@@ -73,9 +80,15 @@ const CATEGORY_TABS: { id: InboxCategory; label: string }[] = [
 ];
 
 const SUGGESTIONS = [
+  "Show my daily briefing",
   "What important emails need my attention?",
   "Which emails require a reply today?",
-  "Summarize high-importance messages this week",
+];
+
+const SELECTED_EMAIL_SUGGESTIONS = [
+  "Summarize this email",
+  "Draft a reply to this email",
+  "What action do I need to take?",
 ];
 
 function greetingForHour(hour: number): string {
@@ -126,17 +139,18 @@ function senderInitial(sender: string | null | undefined): string {
 function formatBriefingSubtitle(isoDate: string, headline?: string): string {
   if (headline) return headline;
   if (!isoDate || !/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) {
-    return "Daily Executive Briefing";
+    return "";
   }
   const parsed = new Date(`${isoDate}T12:00:00`);
   if (Number.isNaN(parsed.getTime())) {
-    return "Daily Executive Briefing";
+    return "";
   }
-  return `Daily Executive Briefing – ${parsed.toLocaleDateString(undefined, {
+  // Full calendar date, e.g. "November 4, 2026"
+  return parsed.toLocaleDateString("en-US", {
     month: "long",
     day: "numeric",
     year: "numeric",
-  })}`;
+  });
 }
 
 export default function HomePage() {
@@ -151,6 +165,18 @@ export default function HomePage() {
     error: briefingError,
     reload: reloadBriefing,
   } = useBriefingHistory();
+
+  const {
+    mode: briefingMode,
+    setMode: setBriefingMode,
+    mondayVisible,
+    modeContent,
+    modeLoading,
+    modeError,
+    modeHasBriefing,
+    regenerateMode,
+    reloadMode,
+  } = useBriefingMode(history?.timezone);
 
   const [category, setCategory] = useState<InboxCategory>(() => {
     const last = readLastInboxCache<Conversation>()?.key.category;
@@ -167,6 +193,15 @@ export default function HomePage() {
   const [selectedEmail, setSelectedEmail] = useState<Email | null>(null);
   const [threadMessages, setThreadMessages] = useState<Email[]>([]);
   const [detailOpen, setDetailOpen] = useState(false);
+  const [detailInitialTab, setDetailInitialTab] = useState<
+    "summary" | "thread" | "draft" | undefined
+  >(undefined);
+  const [detailSeedDraft, setDetailSeedDraft] = useState<{
+    id: string;
+    email_id: string;
+    body: string;
+    status: string;
+  } | null>(null);
   const [loading, setLoading] = useState(
     () => !(readLastInboxCache<Conversation>()?.conversations.length)
   );
@@ -177,6 +212,11 @@ export default function HomePage() {
   const [detailError, setDetailError] = useState("");
   const [generatingBriefing, setGeneratingBriefing] = useState(false);
   const [briefingActionError, setBriefingActionError] = useState("");
+  const [catchupEnabled, setCatchupEnabled] = useState(false);
+  const [catchupOpen, setCatchupOpen] = useState(false);
+  const [endMyDayEnabled, setEndMyDayEnabled] = useState(false);
+  const [endMyDayOpen, setEndMyDayOpen] = useState(false);
+  const autoBriefingAttemptedRef = useRef(autoBriefingAttempted);
   const dateFrom = visibleRange?.startDate ?? null;
   const dateTo = visibleRange?.endDate ?? null;
 
@@ -298,26 +338,65 @@ export default function HomePage() {
   }, [category, rangeReady, dateFrom, dateTo, loadConversations]);
 
   useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const response = await fetch(`${API}/db/catchup/status`);
+        if (!response.ok) return;
+        const data = await response.json();
+        if (!cancelled) setCatchupEnabled(Boolean(data?.enabled));
+      } catch {
+        if (!cancelled) setCatchupEnabled(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const response = await fetch(`${API}/db/end-my-day/status`);
+        if (!response.ok) return;
+        const data = await response.json();
+        if (!cancelled) setEndMyDayEnabled(Boolean(data?.enabled));
+      } catch {
+        if (!cancelled) setEndMyDayEnabled(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     const timer = window.setInterval(() => {
       void loadConversations({ silent: true });
     }, AUTO_REFRESH_MS);
     return () => window.clearInterval(timer);
   }, [loadConversations]);
 
-  async function generateBriefing() {
+  const generateBriefing = useCallback(async () => {
     if (generatingBriefing) return;
-
-    const dateForGenerate = selectedDate || history?.today;
-    if (!dateForGenerate) {
-      setBriefingActionError("Select a date before generating a briefing.");
-      return;
-    }
 
     setGeneratingBriefing(true);
     setBriefingActionError("");
     setError("");
 
     try {
+      if (briefingMode !== "morning") {
+        await regenerateMode();
+        return;
+      }
+
+      const dateForGenerate = selectedDate || history?.today;
+      if (!dateForGenerate) {
+        setBriefingActionError("Select a date before generating a briefing.");
+        return;
+      }
+
       const params = new URLSearchParams({ date: dateForGenerate });
       const response = await fetch(
         `${API}/internal/briefing-now?${params.toString()}`,
@@ -340,7 +419,33 @@ export default function HomePage() {
     } finally {
       setGeneratingBriefing(false);
     }
-  }
+  }, [
+    generatingBriefing,
+    briefingMode,
+    regenerateMode,
+    selectedDate,
+    history?.today,
+    reloadBriefing,
+  ]);
+
+  useEffect(() => {
+    // Morning empty-day auto-generate only — never fire OpenAI on mode filter switch.
+    if (briefingMode !== "morning") return;
+    if (briefingLoading || generatingBriefing) return;
+    if (!selectedDate || !selectedDay) return;
+    if (selectedDay.has_briefing) return;
+    if (autoBriefingAttemptedRef.current.has(selectedDate)) return;
+
+    autoBriefingAttemptedRef.current.add(selectedDate);
+    void generateBriefing();
+  }, [
+    briefingMode,
+    briefingLoading,
+    generatingBriefing,
+    selectedDate,
+    selectedDay,
+    generateBriefing,
+  ]);
 
   async function refreshInbox() {
     setRefreshing(true);
@@ -358,14 +463,29 @@ export default function HomePage() {
         throw new Error(detail || `Inbox sync failed (${syncResponse.status})`);
       }
       await reloadBriefing(selectedDate || undefined);
+      if (briefingMode !== "morning") {
+        await reloadMode();
+      }
       await loadConversations({ silent: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Sync failed");
+    } finally {
       setRefreshing(false);
     }
   }
 
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("gmail") !== "connected") return;
+    window.history.replaceState({}, "", window.location.pathname);
+    void refreshInbox();
+    // One controlled sync after OAuth callback. Refresh inbox is stable enough for mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   async function selectConversation(conv: Conversation) {
+    setDetailInitialTab(undefined);
+    setDetailSeedDraft(null);
     setDetailOpen(true);
     setDetailLoading(true);
     setDetailError("");
@@ -407,13 +527,34 @@ export default function HomePage() {
     }
   }
 
-  async function openEmailById(emailId: string) {
+  async function openEmailById(
+    emailId: string,
+    opts?: {
+      tab?: "summary" | "thread" | "draft";
+      draft?: {
+        id: string;
+        email_id: string;
+        body: string;
+        status: string;
+      } | null;
+    }
+  ) {
+    setDetailInitialTab(opts?.tab);
+    setDetailSeedDraft(
+      opts?.draft && opts.draft.email_id === emailId ? opts.draft : null
+    );
     setDetailOpen(true);
     setDetailLoading(true);
     setDetailError("");
     try {
       const response = await fetch(`${API}/db/emails/${emailId}`);
-      if (!response.ok) throw new Error(`Failed to load email (${response.status})`);
+      if (!response.ok) {
+        throw new Error(
+          response.status === 404
+            ? "This email is no longer available in Buddy AI."
+            : `Failed to load email (${response.status})`
+        );
+      }
       const data: Email = await response.json();
       setSelectedEmail(data);
       setThreadMessages((prev) =>
@@ -428,20 +569,32 @@ export default function HomePage() {
 
   const closeDetail = useCallback(() => {
     setDetailOpen(false);
+    setDetailInitialTab(undefined);
+    setDetailSeedDraft(null);
   }, []);
+
+  const [analysisRequested, setAnalysisRequested] = useState(false);
+  const [analysisError, setAnalysisError] = useState("");
+
+  useEffect(() => {
+    setAnalysisRequested(false);
+    setAnalysisError("");
+  }, [selectedEmail?.id]);
 
   const analysis = getAnalysis(selectedEmail);
   const analysisPending =
-    Boolean(selectedEmail) &&
-    !analysis &&
-    selectedEmail?.analysis_status !== "failed";
+    Boolean(selectedEmail) && !analysis && analysisRequested;
   const analysisFailed =
     Boolean(selectedEmail) &&
     !analysis &&
-    selectedEmail?.analysis_status === "failed";
+    selectedEmail?.analysis_status === "failed" &&
+    !analysisRequested;
 
   useEffect(() => {
-    if (!selectedEmail?.id || analysis || selectedEmail.analysis_status === "failed") {
+    if (!selectedEmail?.id || analysis) {
+      return;
+    }
+    if (!analysisRequested && selectedEmail.analysis_status !== "pending") {
       return;
     }
     let cancelled = false;
@@ -460,26 +613,51 @@ export default function HomePage() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [selectedEmail?.id, selectedEmail?.analysis_status, analysis]);
+  }, [selectedEmail?.id, selectedEmail?.analysis_status, analysisRequested, analysis]);
 
-  const briefingContent = selectedDay?.briefing?.content;
-  const briefingItems = useMemo(() => {
-    const items: { text: string; kind: "action" | "deadline" | "follow" }[] =
-      [];
-    for (const t of briefingContent?.action_items ?? []) {
-      const kind = /follow|reply|respond/i.test(t) ? "follow" : "action";
-      items.push({ text: t, kind });
-    }
-    for (const t of briefingContent?.deadlines ?? []) {
-      items.push({ text: t, kind: "deadline" });
-    }
-    if (!items.length) {
-      for (const t of briefingContent?.highlights ?? []) {
-        items.push({ text: t, kind: "action" });
+  async function requestEmailAnalysis() {
+    if (!selectedEmail?.id || analysisRequested) return;
+    setAnalysisRequested(true);
+    setAnalysisError("");
+    try {
+      const response = await fetch(
+        `${API}/db/emails/${selectedEmail.id}/analyze`,
+        { method: "POST" }
+      );
+      if (!response.ok) {
+        throw new Error(`Analysis failed (${response.status})`);
       }
+      const payload = await response.json();
+      if (payload?.email) {
+        setSelectedEmail(payload.email);
+      }
+    } catch (err) {
+      setAnalysisRequested(false);
+      setAnalysisError(
+        err instanceof Error ? err.message : "Unable to generate AI summary"
+      );
     }
-    return items;
-  }, [briefingContent]);
+  }
+
+  const morningContent = selectedDay?.briefing?.content;
+  const briefingContent =
+    briefingMode === "morning" ? morningContent : modeContent;
+  const showBriefingLoading =
+    briefingMode === "morning"
+      ? briefingLoading && !briefingContent
+      : modeLoading && !briefingContent;
+  const hasDisplayBriefing =
+    briefingMode === "morning"
+      ? Boolean(selectedDay?.has_briefing && briefingContent)
+      : Boolean(modeHasBriefing && briefingContent);
+  const modeTitle =
+    briefingMode === "morning"
+      ? "Daily Briefing"
+      : briefingMode === "evening"
+        ? "Evening Wrap-up"
+        : briefingMode === "weekly"
+          ? "Weekly Digest"
+          : "Monday Planning";
 
   return (
     <div className="home-page">
@@ -543,36 +721,30 @@ export default function HomePage() {
             />
           </div>
           <div className="home-hero-actions">
-            <div className="home-date-pill">
-              <svg
-                className="home-date-icon"
-                width="18"
-                height="18"
-                viewBox="0 0 24 24"
-                fill="none"
-                aria-hidden
+            {catchupEnabled ? (
+              <button
+                type="button"
+                className="home-catchup-btn"
+                onClick={() => {
+                  setEndMyDayOpen(false);
+                  setCatchupOpen(true);
+                }}
               >
-                <rect
-                  x="3"
-                  y="5"
-                  width="18"
-                  height="16"
-                  rx="2"
-                  stroke="currentColor"
-                  strokeWidth="1.75"
-                />
-                <path
-                  d="M3 10h18M8 3v4M16 3v4"
-                  stroke="currentColor"
-                  strokeWidth="1.75"
-                  strokeLinecap="round"
-                />
-              </svg>
-              <div className="home-date-text">
-                <strong>{dateParts.date}</strong>
-                <span>{dateParts.timezone}</span>
-              </div>
-            </div>
+                What Did I Miss?
+              </button>
+            ) : null}
+            {endMyDayEnabled ? (
+              <button
+                type="button"
+                className="home-catchup-btn"
+                onClick={() => {
+                  setCatchupOpen(false);
+                  setEndMyDayOpen(true);
+                }}
+              >
+                End My Day
+              </button>
+            ) : null}
             <button
               type="button"
               className="home-refresh-btn"
@@ -603,7 +775,7 @@ export default function HomePage() {
               </svg>
               {refreshing ? "Syncing…" : "Refresh inbox"}
             </button>
-            <ProfileChip />
+            <ProfileChip date={dateParts.date} timezone={dateParts.timezone} />
           </div>
         </div>
       </header>
@@ -657,9 +829,6 @@ export default function HomePage() {
           {conversations.length > 0 ? (
             <>
               {conversations.map((conv) => {
-                const imp = (
-                  conv.email_analyses?.importance || ""
-                ).toLowerCase();
                 return (
                   <button
                     key={conv.thread_id}
@@ -678,9 +847,12 @@ export default function HomePage() {
                     <div className="home-conv-body">
                       <div className="home-conv-top">
                         <strong>{conv.subject || "No Subject"}</strong>
-                        <time>
-                          {formatTime(conv.internal_date, conv.received_at)}
-                        </time>
+                        <div className="home-conv-top-end">
+                          <EmailGlanceTabs email={conv} />
+                          <time>
+                            {formatTime(conv.internal_date, conv.received_at)}
+                          </time>
+                        </div>
                       </div>
                       <div className="home-conv-sender">
                         {conv.sender || "Unknown sender"}
@@ -688,9 +860,6 @@ export default function HomePage() {
                       <div className="home-conv-snippet">
                         {conv.snippet || "No preview"}
                       </div>
-                      {imp && (
-                        <span className={`home-badge ${imp}`}>{imp}</span>
-                      )}
                     </div>
                   </button>
                 );
@@ -721,96 +890,150 @@ export default function HomePage() {
           )}
         </section>
 
-        <section className="home-briefing-card home-briefing-col" aria-label="Daily Briefing">
-          <div className="home-briefing-card-head">
-            <div className="home-briefing-title">
-              <div className="home-briefing-icon" aria-hidden>
-                ✓
-              </div>
-              <div>
-                <h2>Daily Briefing</h2>
-                <p>
-                  {briefingLoading && !selectedDate
-                    ? "Loading…"
-                    : formatBriefingSubtitle(
-                        selectedDate || history?.today || "",
-                        briefingContent?.headline
-                      )}
-                </p>
-              </div>
-            </div>
-            <div className="home-briefing-actions">
-              <button
-                type="button"
-                className="home-briefing-btn"
-                onClick={() => void generateBriefing()}
-                disabled={
-                  briefingLoading || generatingBriefing || !selectedDate
-                }
-              >
-                {generatingBriefing
-                  ? "Generating…"
-                  : selectedDay?.has_briefing
-                    ? "Regenerate"
-                    : "Generate"}
-              </button>
-              <Link
-                className="home-view-all"
-                to="/briefings"
-                aria-label="View all briefings"
-                title="View all briefings"
-              >
-                <svg
-                  width="16"
-                  height="16"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  aria-hidden
-                >
-                  <path
-                    d="M5 12h14M13 6l6 6-6 6"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  />
-                </svg>
-              </Link>
-            </div>
-          </div>
-          {briefingLoading && briefingItems.length === 0 ? (
-            <p className="home-empty" style={{ padding: "8px 0" }}>
-              Loading briefing…
-            </p>
-          ) : briefingItems.length === 0 ? (
-            <p className="home-empty" style={{ padding: "8px 0" }}>
-              No briefing for this day yet. Use Generate, or wait for the
-              scheduled job.
-            </p>
+        <section
+          className={`home-briefing-card home-briefing-col${
+            catchupOpen || endMyDayOpen ? " catchup-active" : ""
+          }`}
+          aria-label={
+            endMyDayOpen
+              ? "End My Day"
+              : catchupOpen
+                ? "What Did I Miss"
+                : "Daily Briefing"
+          }
+        >
+          {endMyDayEnabled && endMyDayOpen ? (
+            <EndMyDayPanel
+              open={endMyDayOpen}
+              onClose={() => setEndMyDayOpen(false)}
+              onOpenEmail={(id, opts) => void openEmailById(id, opts)}
+            />
+          ) : catchupEnabled && catchupOpen ? (
+            <CatchupPanel
+              open={catchupOpen}
+              onClose={() => setCatchupOpen(false)}
+              onOpenEmail={(id, opts) => void openEmailById(id, opts)}
+            />
           ) : (
-            <ul className="home-briefing-items">
-              {briefingItems.map((item) => (
-                <li key={`${item.kind}-${item.text}`} className="home-briefing-item">
-                  <span
-                    className={`home-briefing-item-icon ${
-                      item.kind === "deadline"
-                        ? "deadline"
-                        : item.kind === "follow"
-                          ? "follow"
-                          : ""
-                    }`}
-                    aria-hidden
+            <>
+              <div className="home-briefing-card-head">
+                <div className="home-briefing-title">
+                  <div className="home-briefing-icon" aria-hidden>
+                    ✓
+                  </div>
+                  <div>
+                    <h2>{modeTitle}</h2>
+                    <p>
+                      {briefingMode === "morning"
+                        ? briefingLoading && !selectedDate
+                          ? "Loading…"
+                          : formatBriefingSubtitle(
+                              selectedDate || history?.today || ""
+                            )
+                        : briefingMode === "evening"
+                          ? "Today's evening wrap-up"
+                          : briefingMode === "weekly"
+                            ? "Latest weekly digest"
+                            : "This week's Monday plan"}
+                    </p>
+                  </div>
+                </div>
+                <div className="home-briefing-actions">
+                  <button
+                    type="button"
+                    className="home-briefing-btn"
+                    onClick={() => void generateBriefing()}
+                    disabled={
+                      generatingBriefing ||
+                      (briefingMode === "morning"
+                        ? briefingLoading || !selectedDate
+                        : modeLoading)
+                    }
                   >
-                    {item.kind === "deadline"
-                      ? "◎"
-                      : item.kind === "follow"
-                        ? "⏱"
-                        : "✓"}
-                  </span>
-                  <span className="home-briefing-item-text">{item.text}</span>
-                </li>
-              ))}
-            </ul>
+                    {generatingBriefing
+                      ? "Generating…"
+                      : hasDisplayBriefing
+                        ? "Regenerate"
+                        : "Generate"}
+                  </button>
+                  <Link
+                    className="home-view-all"
+                    to="/briefings"
+                    aria-label="View all briefings"
+                    title="View all briefings"
+                  >
+                    <svg
+                      width="16"
+                      height="16"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      aria-hidden
+                    >
+                      <path
+                        d="M5 12h14M13 6l6 6-6 6"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                  </Link>
+                </div>
+              </div>
+              <div
+                className="home-briefing-mode-filters"
+                role="tablist"
+                aria-label="Briefing mode"
+              >
+                {MODE_FILTERS.filter(
+                  (f) => f.id !== "monday" || mondayVisible
+                ).map((filter) => {
+                  const active = briefingMode === filter.id;
+                  return (
+                    <button
+                      key={filter.id}
+                      type="button"
+                      role="tab"
+                      aria-selected={active}
+                      className={
+                        active
+                          ? "home-briefing-mode-chip active"
+                          : "home-briefing-mode-chip"
+                      }
+                      onClick={() => setBriefingMode(filter.id)}
+                    >
+                      {filter.label}
+                    </button>
+                  );
+                })}
+              </div>
+              {showBriefingLoading ? (
+                <p className="home-empty" style={{ padding: "8px 0" }}>
+                  Loading briefing…
+                </p>
+              ) : !hasDisplayBriefing ? (
+                <p className="home-empty" style={{ padding: "8px 0" }}>
+                  {generatingBriefing
+                    ? briefingMode === "morning"
+                      ? "Generating today's briefing…"
+                      : `Generating ${modeTitle.toLowerCase()}…`
+                    : briefingActionError || modeError
+                      ? "Briefing could not be loaded. Use Generate to try again."
+                      : briefingMode === "morning"
+                        ? "No briefing for this day yet."
+                        : `${modeTitle} is not ready yet. It will appear after the scheduled run.`}
+                </p>
+              ) : (
+                <DailyBriefingBody
+                  content={briefingContent ?? null}
+                  showTodayOverview={
+                    briefingMode === "morning" &&
+                    selectedDate === history?.today
+                  }
+                  onOpenEmail={(id, opts) => void openEmailById(id, opts)}
+                />
+              )}
+            </>
           )}
         </section>
       </div>
@@ -828,9 +1051,12 @@ export default function HomePage() {
         </div>
         <ChatPanel
           embedded
-          suggestions={SUGGESTIONS}
+          expandable
+          suggestions={
+            selectedEmail ? SELECTED_EMAIL_SUGGESTIONS : SUGGESTIONS
+          }
           emailId={selectedEmail?.id}
-          onOpenEmail={(id) => void openEmailById(id)}
+          onOpenEmail={(id, opts) => void openEmailById(id, opts)}
         />
       </section>
 
@@ -845,7 +1071,11 @@ export default function HomePage() {
         analysis={analysis}
         analysisPending={analysisPending}
         analysisFailed={analysisFailed}
+        analysisError={analysisError}
+        onRequestAnalysis={() => void requestEmailAnalysis()}
         formatTime={formatTime}
+        initialTab={detailInitialTab}
+        initialDraft={detailSeedDraft}
       />
     </div>
   );

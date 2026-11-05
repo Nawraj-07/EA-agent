@@ -73,7 +73,7 @@ def generate_email_draft(email: dict) -> str:
     llm = ChatOpenAI(
         model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         api_key=os.getenv("OPENAI_API_KEY"),
-        temperature=0.3,
+        temperature=0,
     )
 
     action_required_text = (

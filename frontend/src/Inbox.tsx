@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import "./Inbox.css";
 import ChatPanel from "./ChatPanel";
 import DraftPanel from "./DraftPanel";
+import EmailGlanceTabs from "./home/EmailGlanceTabs";
 import { useBriefingVisibleRange } from "./hooks/useBriefingVisibleRange";
 import { API } from "./api";
 const AUTO_REFRESH_MS = 60_000;
@@ -226,7 +227,18 @@ export default function Inbox() {
     }
   }
 
-  async function openEmailById(emailId: string) {
+  async function openEmailById(
+    emailId: string,
+    _opts?: {
+      tab?: "summary" | "thread" | "draft";
+      draft?: {
+        id: string;
+        email_id: string;
+        body: string;
+        status: string;
+      } | null;
+    }
+  ) {
     setDetailLoading(true);
     setDetailError("");
     try {
@@ -377,8 +389,6 @@ export default function Inbox() {
             <h2>Conversations</h2>
 
             {conversations.map((conv) => {
-              const itemAnalysis = conv.email_analyses ?? null;
-
               return (
                 <button
                   key={conv.thread_id}
@@ -393,15 +403,7 @@ export default function Inbox() {
                 >
                   <div className="email-item-top">
                     <strong>{conv.subject || "No Subject"}</strong>
-                    <span
-                      className={`importance ${(
-                        itemAnalysis?.importance || "low"
-                      ).toLowerCase()}`}
-                    >
-                      {itemAnalysis?.importance ||
-                        conv.analysis_status ||
-                        "N/A"}
-                    </span>
+                    <EmailGlanceTabs email={conv} />
                   </div>
 
                   <p>{conv.sender || "Unknown Sender"}</p>
@@ -490,19 +492,35 @@ export default function Inbox() {
 
                 <hr />
 
-                <h3>AI Summary</h3>
+                <h3 className="inbox-summary-heading">
+                  AI Summary
+                  <EmailGlanceTabs
+                    email={{
+                      sender: selectedEmail.sender,
+                      subject: selectedEmail.subject,
+                      snippet: selectedEmail.snippet,
+                      body: selectedEmail.body,
+                      email_analyses:
+                        analysis ?? selectedEmail.email_analyses,
+                    }}
+                  />
+                </h3>
 
                 <p>{analysis?.summary || "No analysis available yet"}</p>
 
                 <div className="analysis-info">
-                  <p>
-                    <strong>Category:</strong>{" "}
-                    {analysis?.category || "N/A"}
-                  </p>
-
-                  <p>
-                    <strong>Importance:</strong>{" "}
-                    {analysis?.importance || "N/A"}
+                  <p className="analysis-info-labels">
+                    <strong>Labels:</strong>
+                    <EmailGlanceTabs
+                      email={{
+                        sender: selectedEmail.sender,
+                        subject: selectedEmail.subject,
+                        snippet: selectedEmail.snippet,
+                        body: selectedEmail.body,
+                        email_analyses:
+                          analysis ?? selectedEmail.email_analyses,
+                      }}
+                    />
                   </p>
 
                   <p>

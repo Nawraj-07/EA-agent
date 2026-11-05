@@ -46,9 +46,17 @@ class AnalyzeRequest(BaseModel):
     message_id: str = Field(..., min_length=1)
 
 
+class ChatSource(BaseModel):
+    email_id: str
+    subject: str | None = None
+    sender: str | None = None
+    gmail_thread_id: str | None = None
+
+
 class ChatHistoryTurn(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(..., min_length=1, max_length=4000)
+    sources: list[ChatSource] | None = None
 
 
 class ChatRequest(BaseModel):
@@ -59,18 +67,61 @@ class ChatRequest(BaseModel):
         default=None,
         description="Optional prior turns (newest last); max 6 applied server-side",
     )
+    selected_contact_id: str | None = Field(
+        default=None,
+        max_length=320,
+        description="Canonical email chosen from a disambiguation card",
+    )
+    bound_contact_id: str | None = Field(
+        default=None,
+        max_length=320,
+        description="Person bound in the current chat panel only",
+    )
+    candidate_offset: int = Field(default=0, ge=0, le=500)
 
 
-class ChatSource(BaseModel):
+class ChatDraft(BaseModel):
+    id: str
     email_id: str
-    subject: str | None = None
-    sender: str | None = None
-    gmail_thread_id: str | None = None
+    body: str
+    status: str
+
+
+class PersonCandidate(BaseModel):
+    id: str
+    name: str
+    email: str
+    company: str | None = None
+    last_interaction: str = ""
+    last_topic: str = ""
+    match_reason: str = ""
+    context: str | None = None
+
+
+class PersonContextCard(BaseModel):
+    name: str
+    email: str = ""
+    addresses: list[str] = Field(default_factory=list)
+    summary: str = ""
+    last_interaction: str = ""
+    pending_actions: list[str] = Field(default_factory=list)
+    follow_up: str = ""
+    emails: list[ChatSource] = Field(default_factory=list)
+    sent_history_incomplete: bool = False
+    draft_email_id: str | None = None
+    recommendation_key: str | None = None
+    alias_note: str | None = None
 
 
 class ChatResponse(BaseModel):
     answer: str
     sources: list[ChatSource] = Field(default_factory=list)
+    draft: ChatDraft | None = None
+    candidates: list[PersonCandidate] = Field(default_factory=list)
+    candidate_total: int = 0
+    candidate_offset: int = 0
+    candidate_has_more: bool = False
+    person: PersonContextCard | None = None
 
 
 class InboxQueryPlan(BaseModel):
@@ -92,6 +143,30 @@ class InboxQueryPlan(BaseModel):
     )
     importance: Literal["low", "medium", "high"] | None = None
     action_required: bool | None = None
+    unread_only: bool = Field(
+        default=False,
+        description="True when the question asks about unread mail",
+    )
+    question_kind: Literal[
+        "focused",
+        "count",
+        "broad_summary",
+        "comparison",
+        "general",
+        "draft_reply",
+        "briefing",
+    ] = Field(
+        default="focused",
+        description=(
+            "focused: retrieve a few relevant emails; "
+            "count: how many emails match; "
+            "broad_summary: summarize a bounded set of matches; "
+            "comparison: compare counts across two periods; "
+            "general: not about the mailbox; "
+            "draft_reply: generate a reply draft for one email; "
+            "briefing: answer from the saved daily briefing"
+        ),
+    )
     use_recent_fallback: bool = Field(
         default=False,
         description="True when the question does not imply filters",

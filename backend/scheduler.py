@@ -26,6 +26,7 @@ from typing import Any
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
+from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError
 
 from ai_service import analyze_email_content
@@ -65,6 +66,7 @@ DEFAULT_MAX_BACKFILL_PAGES = 3
 DEFAULT_NEWEST_PAGES = 3
 DEFAULT_RECENT_SYNC_PAGES = 5
 DEFAULT_RECONCILE_PAGES = 10
+DEFAULT_INBOX_BACKFILL_AFTER = "2026/05/31"
 INGEST_FETCH_RETRIES = 3
 
 
@@ -168,6 +170,41 @@ def _reconcile_pages() -> int:
         return max(1, min(int(raw), 50))
     except ValueError:
         return DEFAULT_RECONCILE_PAGES
+
+
+def inbox_backfill_query() -> str:
+    after = (
+        os.getenv("GMAIL_INBOX_BACKFILL_AFTER", DEFAULT_INBOX_BACKFILL_AFTER).strip()
+        or DEFAULT_INBOX_BACKFILL_AFTER
+    )
+    return f"in:inbox after:{after}"
+
+
+def _backfill_token_prefix() -> str:
+    after = (
+        os.getenv("GMAIL_INBOX_BACKFILL_AFTER", DEFAULT_INBOX_BACKFILL_AFTER).strip()
+        or DEFAULT_INBOX_BACKFILL_AFTER
+    )
+    return f"q{after.replace('/', '')}:"
+
+
+def wrap_backfill_page_token(token: str | None) -> str | None:
+    if not token:
+        return None
+    prefix = _backfill_token_prefix()
+    if token.startswith(prefix):
+        return token
+    return f"{prefix}{token}"
+
+
+def unwrap_backfill_page_token(token: str | None) -> tuple[str | None, bool]:
+    """Return (gmail_page_token, stale). Stale tokens from a prior query are dropped."""
+    if not token:
+        return None, False
+    prefix = _backfill_token_prefix()
+    if token.startswith(prefix):
+        return token[len(prefix) :] or None, False
+    return None, True
 
 
 def ingest_newest_inbox(
@@ -353,6 +390,13 @@ def _ingest_message_ids(
                 break
             except Exception as exc:
                 last_exc = exc
+                if _is_auth_failure(exc):
+                    logger.warning(
+                        "Gmail ingest paused for message_id=%s: authentication error type=%s",
+                        message_id,
+                        type(exc).__name__,
+                    )
+                    break
                 if attempt < INGEST_FETCH_RETRIES - 1:
                     time.sleep(min(0.5 * (2 ** attempt), 4.0))
         if last_exc is not None:
@@ -371,15 +415,25 @@ def _run_backfill(
     state: dict | None,
     stats: dict[str, Any],
 ) -> None:
-    page_token = (state or {}).get("backfill_page_token")
-    upsert_sync_state(account, backfill_status="running")
+    raw_token = (state or {}).get("backfill_page_token")
+    page_token, stale_token = unwrap_backfill_page_token(raw_token)
+    if stale_token:
+        logger.info(
+            "Clearing backfill page token after Inbox query change account=%s",
+            account,
+        )
+        upsert_sync_state(account, backfill_status="running", clear_page_token=True)
+        page_token = None
+    else:
+        upsert_sync_state(account, backfill_status="running")
 
+    query = inbox_backfill_query()
     pages = 0
     while pages < _max_backfill_pages():
         pages += 1
         page = list_messages_page(
             credentials,
-            label_ids=["INBOX"],
+            q=query,
             page_token=page_token,
             max_results=_batch_size(),
         )
@@ -412,7 +466,7 @@ def _run_backfill(
 
         upsert_sync_state(
             account,
-            backfill_page_token=page_token,
+            backfill_page_token=wrap_backfill_page_token(page_token),
             backfill_status="running",
         )
 
@@ -508,8 +562,20 @@ def analyze_pending_emails(
                 sender=row.get("sender") or "",
                 body=row.get("body") or "",
             )
-            save_analysis_for_email(row["id"], analysis.model_dump())
+            analysis_data = analysis.model_dump()
+            save_analysis_for_email(row["id"], analysis_data)
             stats["analyzed"] += 1
+            try:
+                if str(analysis_data.get("importance") or "").lower() == "high":
+                    from whatsapp_notifications import notify_whatsapp_important_email
+
+                    notify_whatsapp_important_email(row, analysis_data)
+            except Exception:
+                logger.exception(
+                    "WhatsApp important-email notify failed email_id=%s "
+                    "(analysis remains saved)",
+                    row.get("id"),
+                )
         except Exception:
             stats["failed"] += 1
             try:
@@ -523,12 +589,25 @@ def analyze_pending_emails(
     return stats
 
 
+def _is_auth_failure(exc: BaseException) -> bool:
+    if isinstance(exc, RefreshError):
+        return True
+    if isinstance(exc, HttpError) and getattr(exc.resp, "status", None) in {401, 403}:
+        return True
+    return False
+
+
 def run_analysis_queue() -> dict[str, int]:
     """Drain pending summaries for stored mail. Does not touch Gmail."""
     from fastapi import HTTPException
+    from gmail_oauth import STATUS_RECONNECT_REQUIRED, get_gmail_auth_snapshot
     from main import load_gmail_credentials
 
     empty = {"analyzed": 0, "failed": 0, "skipped": 0}
+    snap = get_gmail_auth_snapshot()
+    if snap.get("status") == STATUS_RECONNECT_REQUIRED:
+        logger.info("Analysis queue skipped: Gmail reconnect required")
+        return empty
     try:
         credentials = load_gmail_credentials()
         account = get_profile_email(credentials)
@@ -559,6 +638,16 @@ def sync_gmail_inbox() -> dict[str, Any]:
 
     Safe when Gmail auth is missing/expired: logs and returns without raising.
     """
+    from gmail_oauth import set_gmail_syncing
+
+    set_gmail_syncing(True)
+    try:
+        return _sync_gmail_inbox_impl()
+    finally:
+        set_gmail_syncing(False)
+
+
+def _sync_gmail_inbox_impl() -> dict[str, Any]:
     from fastapi import HTTPException
     from main import load_gmail_credentials
 
@@ -577,24 +666,32 @@ def sync_gmail_inbox() -> dict[str, Any]:
         "account": None,
         "reconcile_scanned": 0,
         "reconcile_missing": 0,
+        "status": "started",
     }
 
     try:
         credentials = load_gmail_credentials()
     except HTTPException as exc:
+        detail = getattr(exc, "detail", None) or "Gmail authentication unavailable."
         logger.warning(
             "Gmail sync skipped: authentication unavailable (%s)",
-            getattr(exc, "detail", type(exc).__name__),
+            detail,
         )
+        stats["status"] = "auth_unavailable"
+        stats["error"] = str(detail)
         return stats
     except Exception:
         logger.exception("Gmail sync skipped: unexpected auth failure")
+        stats["status"] = "auth_unavailable"
+        stats["error"] = "Gmail authentication unavailable."
         return stats
 
     try:
         account = get_profile_email(credentials)
     except Exception:
         logger.exception("Gmail sync skipped: profile email unavailable")
+        stats["status"] = "auth_unavailable"
+        stats["error"] = "Gmail profile unavailable."
         return stats
 
     stats["account"] = account
@@ -680,12 +777,22 @@ def sync_gmail_inbox() -> dict[str, Any]:
                     )
                     _run_backfill(credentials, account, get_sync_state(account), stats)
     except HttpError as exc:
-        logger.warning(
-            "Gmail sync HttpError status=%s",
-            getattr(exc.resp, "status", "?"),
-        )
+        status = getattr(exc.resp, "status", None)
+        logger.warning("Gmail sync HttpError status=%s", status)
+        from gmail_oauth import note_gmail_reconnect, note_gmail_temporary
+
+        if status in {401, 403}:
+            note_gmail_reconnect("gmail_http_unauthorized", "Gmail API rejected the access token.")
+        elif status in {429, 500, 502, 503, 504}:
+            note_gmail_temporary(
+                "Gmail API temporarily failed. Sync will retry.",
+                str(status),
+            )
     except Exception:
         logger.exception("Gmail sync failed")
+        from gmail_oauth import note_gmail_temporary
+
+        note_gmail_temporary("Gmail sync hit an unexpected error. Sync will retry.")
 
     try:
         analyze_stats = analyze_pending_emails(
@@ -697,12 +804,30 @@ def sync_gmail_inbox() -> dict[str, Any]:
     except Exception:
         logger.exception("Analyze pass failed (inbox ingest already committed)")
 
+    stats["status"] = stats.get("status") or "ok"
+
+    # AI Follow-up Assistant: soft refresh after sync (no OpenAI, never blocks sync)
+    try:
+        from ai_followup_assistant import (
+            ai_followup_assistant_enabled,
+            refresh_followups_after_sync,
+        )
+
+        if ai_followup_assistant_enabled():
+            followup_stats = refresh_followups_after_sync(account)
+            stats["followup_refresh"] = followup_stats
+    except Exception:
+        logger.exception(
+            "Follow-up refresh after sync failed; Gmail sync results preserved"
+        )
+
     logger.info(
-        "Gmail sync finished account=%s mode=%s checked=%s saved=%s "
+        "Gmail sync finished account=%s mode=%s status=%s checked=%s saved=%s "
         "failed=%s archived=%s analyzed=%s analyze_failed=%s "
         "reconcile_scanned=%s reconcile_missing=%s",
         account,
         stats["mode"],
+        stats["status"],
         stats["checked"],
         stats["saved"],
         stats["failed"],
@@ -754,6 +879,230 @@ def run_daily_briefing_once(target_date=None) -> dict:
     return run_daily_briefing_job(target_date=target_date)
 
 
+def run_smart_mode_briefing_job(mode: str) -> dict:
+    """Optional evening/weekly/monday job. Failures must not affect daily briefing."""
+    try:
+        from briefing_modes import compute_mode_period, mode_enabled, run_mode_briefing
+        from briefing_service import _resolve_briefing_account
+
+        if not mode_enabled(mode):
+            logger.info("Smart mode job skipped (disabled) mode=%s", mode)
+            return {"mode": mode, "status": "disabled", "saved": False}
+
+        account = _resolve_briefing_account()
+        if account:
+            try:
+                from db import try_claim_briefing_schedule
+
+                period = compute_mode_period(mode)
+                claimed = try_claim_briefing_schedule(
+                    gmail_account_email=account,
+                    job_kind=mode,
+                    period_key=str(period.get("period_key") or ""),
+                    metadata={"source": "env_mode_job"},
+                )
+                if claimed is None and period.get("period_key"):
+                    logger.info(
+                        "Smart mode job skipped (already claimed) mode=%s period=%s",
+                        mode,
+                        period.get("period_key"),
+                    )
+                    return {
+                        "mode": mode,
+                        "status": "already_claimed",
+                        "saved": False,
+                        "period_key": period.get("period_key"),
+                    }
+            except Exception:
+                # Claim table may be missing until migration; continue safely.
+                logger.exception(
+                    "Schedule claim unavailable for mode=%s; continuing once", mode
+                )
+
+        stats = run_mode_briefing(mode, force=False)
+        logger.info("Smart mode job finished mode=%s status=%s", mode, stats.get("status"))
+        return stats
+    except Exception:
+        logger.exception("Smart mode job crashed mode=%s", mode)
+        return {"mode": mode, "status": "job_crashed", "saved": False}
+
+
+def run_personalized_mode_briefing_job(mode: str) -> dict:
+    """
+    Preference-driven mode job (Task 5). Separate job ids from env mode jobs.
+    Morning/daily schedule is never overridden here.
+    """
+    try:
+        from briefing_modes import compute_mode_period, run_mode_briefing
+        from briefing_preferences import get_preferences_for_account, personalization_enabled
+        from briefing_service import _resolve_briefing_account
+
+        if not personalization_enabled():
+            return {"mode": mode, "status": "personalization_disabled", "saved": False}
+        if mode not in {"evening", "weekly", "monday"}:
+            return {"mode": mode, "status": "unsupported", "saved": False}
+
+        account = _resolve_briefing_account()
+        if not account:
+            return {"mode": mode, "status": "no_account", "saved": False}
+
+        prefs = get_preferences_for_account(account).get("preferences") or {}
+        schedule = (prefs.get("mode_schedules") or {}).get(mode) or {}
+        if not schedule.get("enabled"):
+            return {"mode": mode, "status": "schedule_disabled", "saved": False}
+
+        period = compute_mode_period(mode)
+        try:
+            from db import try_claim_briefing_schedule
+
+            claimed = try_claim_briefing_schedule(
+                gmail_account_email=account,
+                job_kind=mode,
+                period_key=str(period.get("period_key") or ""),
+                metadata={"source": "personalized_mode_job"},
+            )
+            if claimed is None and period.get("period_key"):
+                return {
+                    "mode": mode,
+                    "status": "already_claimed",
+                    "saved": False,
+                    "period_key": period.get("period_key"),
+                }
+        except Exception:
+            logger.exception(
+                "Personalized schedule claim failed mode=%s; continuing once", mode
+            )
+
+        stats = run_mode_briefing(mode, force=False)
+        stats["personalized"] = True
+        return stats
+    except Exception:
+        logger.exception("Personalized mode job crashed mode=%s", mode)
+        return {"mode": mode, "status": "job_crashed", "saved": False}
+
+
+def _register_smart_briefing_mode_jobs(scheduler: BackgroundScheduler) -> None:
+    """
+    Authoritative auto path for Evening / Weekly / Monday (Task 3 env flags).
+
+    Morning stays solely on daily_email_briefing — never register a second
+    morning job here. Job ids: smart_briefing_{evening|weekly|monday}.
+    """
+    try:
+        from briefing_modes import mode_enabled
+        from briefing_service import get_briefing_tz
+
+        zone = get_briefing_tz()
+    except Exception:
+        logger.exception("Could not load smart briefing mode scheduler helpers")
+        return
+
+    # Defaults: evening 17:00, weekly Saturday 17:00, monday 08:30 — local TZ.
+    specs = (
+        ("evening", CronTrigger(hour=17, minute=0, timezone=zone), "smart_briefing_evening"),
+        (
+            "weekly",
+            CronTrigger(day_of_week="sat", hour=17, minute=0, timezone=zone),
+            "smart_briefing_weekly",
+        ),
+        (
+            "monday",
+            CronTrigger(day_of_week="mon", hour=8, minute=30, timezone=zone),
+            "smart_briefing_monday",
+        ),
+    )
+    for mode, trigger, job_id in specs:
+        if not mode_enabled(mode):
+            continue
+        scheduler.add_job(
+            run_smart_mode_briefing_job,
+            trigger=trigger,
+            kwargs={"mode": mode},
+            id=job_id,
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600,
+        )
+        logger.info("Registered smart briefing mode job id=%s mode=%s", job_id, mode)
+
+
+def _register_personalized_briefing_jobs(scheduler: BackgroundScheduler) -> None:
+    """
+    Register preference-enabled mode schedules only.
+    Does not alter daily_email_briefing. Does not register morning overrides.
+    Skips modes already covered by env-enabled Task 3 jobs to avoid duplicates.
+    """
+    try:
+        from briefing_modes import mode_enabled
+        from briefing_preferences import (
+            get_preferences_for_account,
+            parse_schedule_hhmm,
+            personalization_enabled,
+        )
+        from briefing_service import _resolve_briefing_account
+        from zoneinfo import ZoneInfo
+    except Exception:
+        logger.exception("Could not load personalized briefing scheduler helpers")
+        return
+
+    if not personalization_enabled():
+        return
+
+    account = _resolve_briefing_account()
+    if not account:
+        logger.info("Personalized briefing jobs skipped (no authorized account)")
+        return
+
+    try:
+        prefs = get_preferences_for_account(account).get("preferences") or {}
+    except Exception:
+        logger.exception("Could not load preferences for personalized jobs")
+        return
+
+    schedules = prefs.get("mode_schedules") or {}
+    for mode in ("evening", "weekly", "monday"):
+        # Prefer env Task-3 job when that flag is on — avoid duplicate generation paths.
+        if mode_enabled(mode):
+            continue
+        schedule = schedules.get(mode) or {}
+        if not schedule.get("enabled"):
+            continue
+        try:
+            hour, minute = parse_schedule_hhmm(str(schedule.get("local_time") or "09:00"))
+            tz_name = str(schedule.get("timezone") or prefs.get("timezone") or "Asia/Kolkata")
+            zone = ZoneInfo(tz_name)
+            weekday = schedule.get("weekday")
+            trigger_kwargs: dict[str, Any] = {
+                "hour": hour,
+                "minute": minute,
+                "timezone": zone,
+            }
+            if mode == "weekly" and weekday:
+                trigger_kwargs["day_of_week"] = str(weekday)[:3]
+            if mode == "monday":
+                trigger_kwargs["day_of_week"] = "mon"
+            job_id = f"personalized_briefing_{mode}"
+            scheduler.add_job(
+                run_personalized_mode_briefing_job,
+                trigger=CronTrigger(**trigger_kwargs),
+                kwargs={"mode": mode},
+                id=job_id,
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=3600,
+            )
+            logger.info(
+                "Registered personalized briefing job id=%s mode=%s tz=%s",
+                job_id,
+                mode,
+                tz_name,
+            )
+        except Exception:
+            logger.exception("Failed registering personalized job mode=%s", mode)
+
+
 def start_scheduler() -> None:
     global _scheduler
 
@@ -784,6 +1133,7 @@ def start_scheduler() -> None:
         max_instances=1,
         coalesce=True,
         misfire_grace_time=60,
+        next_run_time=datetime.now(timezone.utc),
     )
     _scheduler.add_job(
         run_analysis_queue,
@@ -808,6 +1158,27 @@ def start_scheduler() -> None:
         coalesce=True,
         misfire_grace_time=3600,
     )
+    try:
+        from whatsapp_service import whatsapp_enabled
+
+        if whatsapp_enabled():
+            from whatsapp_notifications import flush_whatsapp_outbox
+
+            _scheduler.add_job(
+                flush_whatsapp_outbox,
+                trigger=IntervalTrigger(minutes=5),
+                id="whatsapp_outbox_flush",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=120,
+            )
+    except Exception:
+        logger.exception("Could not register WhatsApp outbox flush job")
+
+    _register_smart_briefing_mode_jobs(_scheduler)
+    _register_personalized_briefing_jobs(_scheduler)
+
     _scheduler.start()
     logger.info(
         "Scheduler started: gmail_sync every %s min; "

@@ -94,9 +94,61 @@ CREATE TABLE IF NOT EXISTS public.gmail_oauth_credentials (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS public.whatsapp_notification_outbox (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    notification_type TEXT NOT NULL
+        CHECK (notification_type IN (
+            'test',
+            'daily_briefing',
+            'important_email',
+            'meeting_reminder',
+            'payment_alert'
+        )),
+    recipient TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    template_name TEXT NOT NULL,
+    template_language TEXT NOT NULL DEFAULT 'en_US',
+    status TEXT NOT NULL DEFAULT 'queued',
+    meta_message_id TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    payload_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    sent_at TIMESTAMPTZ,
+    delivered_at TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS whatsapp_outbox_dedupe_idx
+    ON public.whatsapp_notification_outbox (notification_type, source_id, recipient);
+
+CREATE TABLE IF NOT EXISTS public.smart_briefing_mode_runs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    gmail_account_email TEXT NOT NULL,
+    mode TEXT NOT NULL
+        CHECK (mode IN ('evening', 'weekly', 'monday')),
+    period_key TEXT NOT NULL,
+    period_start TIMESTAMPTZ NOT NULL,
+    period_end TIMESTAMPTZ NOT NULL,
+    content JSONB NOT NULL DEFAULT '{}'::jsonb,
+    email_count INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'saved'
+        CHECK (status IN ('saved', 'failed', 'empty')),
+    error_message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT smart_briefing_mode_runs_account_mode_period_key
+        UNIQUE (gmail_account_email, mode, period_key)
+);
+
+CREATE INDEX IF NOT EXISTS smart_briefing_mode_runs_account_mode_created_idx
+    ON public.smart_briefing_mode_runs (gmail_account_email, mode, created_at DESC);
+
 ALTER TABLE public.emails ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.email_analyses ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.drafts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.daily_briefings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.gmail_sync_state ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.gmail_oauth_credentials ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.whatsapp_notification_outbox ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.smart_briefing_mode_runs ENABLE ROW LEVEL SECURITY;

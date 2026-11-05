@@ -1,19 +1,20 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { API } from "./api";
-
-type BriefingContent = {
-  headline?: string;
-  highlights?: string[];
-  deadlines?: string[];
-  action_items?: string[];
-  notes?: string;
-  email_count?: number;
-};
+import DailyBriefingBody from "./home/DailyBriefingBody";
+import type { BriefingContent } from "./home/briefingTypes";
+import {
+  readBriefingHistoryCache,
+  writeBriefingHistoryCache,
+} from "./hooks/useBriefingHistory";
+import EmailDetailPopup, {
+  type PopupEmail,
+  type PopupEmailAnalysis,
+} from "./home/EmailDetailPopup";
 
 type Briefing = {
   id: string;
   content: BriefingContent;
-  email_count: number;
+  email_count?: number;
   period_start?: string | null;
   period_end?: string | null;
   created_at?: string | null;
@@ -57,16 +58,36 @@ type BriefingPanelProps = {
   onVisibleRangeChange?: (range: BriefingVisibleRange | null) => void;
 };
 
+function historyFromCache(): HistoryResponse | null {
+  const cached = readBriefingHistoryCache();
+  if (!cached) return null;
+  return cached.history;
+}
+
 export default function BriefingPanel({
   onVisibleRangeChange,
 }: BriefingPanelProps) {
-  const [days, setDays] = useState<HistoryDay[]>([]);
-  const [today, setToday] = useState("");
-  const [timezone, setTimezone] = useState("");
-  const [selectedDate, setSelectedDate] = useState("");
-  const [loading, setLoading] = useState(true);
+  const cachedHistory = historyFromCache();
+  const [days, setDays] = useState<HistoryDay[]>(
+    () => (cachedHistory?.days as HistoryDay[] | undefined) ?? []
+  );
+  const [today, setToday] = useState(cachedHistory?.today ?? "");
+  const [timezone, setTimezone] = useState(cachedHistory?.timezone ?? "");
+  const [selectedDate, setSelectedDate] = useState(() => {
+    const seeded = historyFromCache();
+    if (!seeded) return "";
+    if (seeded.today && seeded.days.some((day) => day.date === seeded.today)) {
+      return seeded.today;
+    }
+    return seeded.days[seeded.days.length - 1]?.date || "";
+  });
+  const [loading, setLoading] = useState(() => historyFromCache() == null);
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState("");
+  const [detailOpen, setDetailOpen] = useState(false);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState("");
+  const [selectedEmail, setSelectedEmail] = useState<PopupEmail | null>(null);
 
   const loadHistory = useCallback(async (preferDate?: string) => {
     try {
@@ -96,6 +117,11 @@ export default function BriefingPanel({
       setDays(nextDays);
       setToday(payload.today || "");
       setTimezone(payload.timezone || "");
+      writeBriefingHistoryCache({
+        timezone: payload.timezone || "",
+        today: payload.today || "",
+        days: nextDays,
+      });
 
       const preferred =
         preferDate && nextDays.some((d) => d.date === preferDate)
@@ -127,6 +153,7 @@ export default function BriefingPanel({
   }, [onVisibleRangeChange]);
 
   useEffect(() => {
+    if (readBriefingHistoryCache()) return;
     void loadHistory();
   }, [loadHistory]);
 
@@ -174,9 +201,37 @@ export default function BriefingPanel({
 
   const briefing = selectedDay?.briefing ?? null;
   const content = briefing?.content ?? {};
-  const highlights = content.highlights ?? [];
-  const deadlines = content.deadlines ?? [];
-  const actionItems = content.action_items ?? [];
+
+  async function openEmailById(emailId: string) {
+    setDetailOpen(true);
+    setDetailLoading(true);
+    setDetailError("");
+    try {
+      const response = await fetch(`${API}/db/emails/${emailId}`);
+      if (!response.ok) {
+        throw new Error(
+          response.status === 404
+            ? "This email is no longer available in Buddy AI."
+            : `Failed to load email (${response.status})`
+        );
+      }
+      const data: PopupEmail = await response.json();
+      setSelectedEmail(data);
+    } catch (err) {
+      setDetailError(
+        err instanceof Error ? err.message : "Something went wrong"
+      );
+    } finally {
+      setDetailLoading(false);
+    }
+  }
+
+  const analysis: PopupEmailAnalysis | null = (() => {
+    if (!selectedEmail) return null;
+    const analyses = selectedEmail.email_analyses;
+    if (Array.isArray(analyses)) return analyses[0] ?? null;
+    return analyses ?? null;
+  })();
 
   return (
     <section className="briefing-panel">
@@ -278,48 +333,36 @@ export default function BriefingPanel({
             </p>
           )}
 
-          {content.notes && <p className="briefing-notes">{content.notes}</p>}
-
-          <div className="briefing-columns">
-            <div>
-              <h4>Highlights</h4>
-              {highlights.length ? (
-                <ul>
-                  {highlights.map((item, index) => (
-                    <li key={`h-${index}`}>{item}</li>
-                  ))}
-                </ul>
-              ) : (
-                <p>None</p>
-              )}
-            </div>
-            <div>
-              <h4>Deadlines</h4>
-              {deadlines.length ? (
-                <ul>
-                  {deadlines.map((item, index) => (
-                    <li key={`d-${index}`}>{item}</li>
-                  ))}
-                </ul>
-              ) : (
-                <p>None</p>
-              )}
-            </div>
-            <div>
-              <h4>Action items</h4>
-              {actionItems.length ? (
-                <ul>
-                  {actionItems.map((item, index) => (
-                    <li key={`a-${index}`}>{item}</li>
-                  ))}
-                </ul>
-              ) : (
-                <p>None</p>
-              )}
-            </div>
-          </div>
+          <DailyBriefingBody
+            content={content}
+            showTodayOverview={selectedDate === today}
+            onOpenEmail={(id) => void openEmailById(id)}
+          />
         </div>
       )}
+
+      <EmailDetailPopup
+        open={detailOpen}
+        onClose={() => setDetailOpen(false)}
+        selectedEmail={selectedEmail}
+        threadMessages={selectedEmail ? [selectedEmail] : []}
+        onSelectThreadMessage={setSelectedEmail}
+        detailLoading={detailLoading}
+        detailError={detailError}
+        analysis={analysis}
+        analysisPending={false}
+        analysisFailed={false}
+        formatTime={(internalDate, fallback) => {
+          if (internalDate) {
+            return new Date(internalDate).toLocaleString(undefined, {
+              hour: "numeric",
+              minute: "2-digit",
+            });
+          }
+          if (fallback) return new Date(fallback).toLocaleString();
+          return "";
+        }}
+      />
     </section>
   );
 }

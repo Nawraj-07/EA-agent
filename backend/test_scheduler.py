@@ -197,7 +197,10 @@ def test_history_during_backfill_does_not_clear_page_token():
         if call.get("history_id") == "11" and call.get("clear_page_token")
     ]
     assert history_upserts == []
-    assert any(call.get("backfill_page_token") == "page-5" for call in upsert_calls)
+    assert any(
+        str(call.get("backfill_page_token") or "").endswith("page-5")
+        for call in upsert_calls
+    )
 
 
 def test_reconcile_ingests_only_missing_ids():
@@ -285,6 +288,40 @@ def test_sync_runs_unread_catchup_and_reconcile():
     assert mock_recent.call_count == 2
 
 
+def test_backfill_lists_inbox_after_june_2026():
+    fake_creds = object()
+    list_calls: list[dict] = []
+
+    def capture_list(*_args, **kwargs):
+        list_calls.append(kwargs)
+        return {"message_ids": ["m1"], "next_page_token": None}
+
+    with (
+        patch("main.load_gmail_credentials", return_value=fake_creds),
+        patch("scheduler.get_profile_email", return_value="me@example.com"),
+        patch("scheduler.get_sync_state", return_value={"backfill_page_token": "old-token"}),
+        patch("scheduler.ingest_newest_inbox"),
+        patch("scheduler.ingest_recent_inbox"),
+        patch("scheduler.reconcile_missing_inbox"),
+        patch("scheduler.list_messages_page", side_effect=capture_list),
+        patch("scheduler.get_profile_history_id", return_value="hist-1"),
+        patch("scheduler.upsert_sync_state") as mock_upsert,
+        patch(
+            "scheduler.fetch_message_for_ingest",
+            return_value={"id": "m1", "in_inbox": True},
+        ),
+        patch("scheduler.upsert_email_record"),
+        patch("scheduler.list_pending_analysis_emails", return_value=[]),
+    ):
+        stats = scheduler.sync_gmail_inbox()
+
+    assert stats["mode"] == "backfill"
+    assert list_calls
+    assert list_calls[0].get("q") == "in:inbox after:2026/05/31"
+    assert "label_ids" not in list_calls[0]
+    assert any(call.kwargs.get("clear_page_token") for call in mock_upsert.call_args_list)
+
+
 def test_analyze_pending_can_filter_pending_only():
     with patch("scheduler.list_pending_analysis_emails", return_value=[]) as mock_list:
         scheduler.analyze_pending_emails(
@@ -294,6 +331,56 @@ def test_analyze_pending_can_filter_pending_only():
 
     assert mock_list.call_args.kwargs["statuses"] == ["pending"]
     assert mock_list.call_args.kwargs["gmail_account_email"] == "me@example.com"
+
+
+def test_auto_analyze_cutoff_defaults_to_two_days():
+    from datetime import datetime, timezone
+
+    from db import auto_analyze_cutoff_ms
+
+    now = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
+    cutoff = auto_analyze_cutoff_ms(now=now)
+    expected = int(datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    assert cutoff == expected
+
+
+def test_auto_analyze_cutoff_disabled_when_days_zero():
+    from db import auto_analyze_cutoff_ms
+
+    with patch.dict("os.environ", {"GMAIL_AUTO_ANALYZE_NEWER_THAN_DAYS": "0"}):
+        assert auto_analyze_cutoff_ms() is None
+
+
+def test_analysis_queue_skips_when_reconnect_required():
+    with patch(
+        "gmail_oauth.get_gmail_auth_snapshot",
+        return_value={"status": "reconnect_required"},
+    ), patch("main.load_gmail_credentials") as mock_load:
+        stats = scheduler.run_analysis_queue()
+    assert stats["analyzed"] == 0
+    mock_load.assert_not_called()
+
+
+def test_ingest_does_not_retry_refresh_error():
+    from google.auth.exceptions import RefreshError
+
+    stats = {"checked": 0, "saved": 0, "failed": 0}
+    with (
+        patch(
+            "scheduler.fetch_message_for_ingest",
+            side_effect=RefreshError(
+                "invalid_grant: Token has been expired or revoked.",
+                {"error": "invalid_grant"},
+            ),
+        ),
+        patch("scheduler.upsert_email_record") as mock_upsert,
+        patch("scheduler.time.sleep") as mock_sleep,
+    ):
+        scheduler._ingest_message_ids(object(), "me@example.com", ["m1"], stats)
+
+    assert stats["failed"] == 1
+    assert mock_upsert.call_count == 0
+    mock_sleep.assert_not_called()
 
 
 def test_scheduler_safe_when_gmail_auth_missing():
@@ -307,6 +394,8 @@ def test_scheduler_safe_when_gmail_auth_missing():
 
     assert stats["checked"] == 0
     assert stats["saved"] == 0
+    assert stats["status"] == "auth_unavailable"
+    assert "Gmail not connected" in str(stats.get("error") or "")
 
 
 def test_scheduler_disabled_when_flag_false():
@@ -326,6 +415,11 @@ if __name__ == "__main__":
     test_ingest_retries_then_succeeds()
     test_sync_runs_unread_catchup_and_reconcile()
     test_analyze_pending_can_filter_pending_only()
+    test_backfill_lists_inbox_after_june_2026()
+    test_auto_analyze_cutoff_defaults_to_two_days()
+    test_auto_analyze_cutoff_disabled_when_days_zero()
+    test_analysis_queue_skips_when_reconnect_required()
+    test_ingest_does_not_retry_refresh_error()
     test_scheduler_safe_when_gmail_auth_missing()
     test_scheduler_disabled_when_flag_false()
     print("All scheduler tests passed.")

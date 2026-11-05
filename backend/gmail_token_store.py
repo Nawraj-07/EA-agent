@@ -89,11 +89,32 @@ def persist_payload(
         raise TokenStoreError("Gmail credentials JSON is invalid") from exc
 
     with _lock:
+        payload = _retain_refresh_token(payload, token_path=token_path)
         _persist_unlocked(
             payload,
             token_path=token_path,
             token_expiry=token_expiry,
         )
+
+
+def _retain_refresh_token(payload: str, *, token_path: Path) -> str:
+    """Keep the stored refresh token if a new access-token save omitted it."""
+    try:
+        data = json.loads(payload)
+    except (TypeError, ValueError):
+        return payload
+    if not isinstance(data, dict) or data.get("refresh_token"):
+        return payload
+    try:
+        existing = json.loads(_load_unlocked(token_path=token_path))
+    except (TokenStoreMissingError, TokenStoreError, TokenCryptoError, OSError, ValueError, TypeError):
+        return payload
+    prior = existing.get("refresh_token") if isinstance(existing, dict) else None
+    if not prior:
+        return payload
+    data["refresh_token"] = prior
+    logger.info("Preserved existing Gmail refresh token while saving a new access token")
+    return json.dumps(data)
 
 
 def load_credentials_payload(*, token_path: Path) -> str:

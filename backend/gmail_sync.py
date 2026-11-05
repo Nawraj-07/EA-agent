@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH_SIZE = 100
 MAX_RETRIES = 5
+TRANSIENT_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
 USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 USERINFO_SCOPES = frozenset(
     {
@@ -59,7 +60,7 @@ def _execute_with_backoff(request):
         except HttpError as exc:
             last_exc = exc
             status = getattr(exc.resp, "status", None)
-            if status in {429, 500, 502, 503, 504} and attempt < MAX_RETRIES - 1:
+            if status in TRANSIENT_HTTP_STATUSES and attempt < MAX_RETRIES - 1:
                 logger.warning(
                     "Gmail API transient error status=%s attempt=%s; backing off %.1fs",
                     status,
@@ -70,9 +71,15 @@ def _execute_with_backoff(request):
                 delay = min(delay * 2, 30)
                 continue
             raise
-        except Exception as exc:
+        except (OSError, TimeoutError, URLError) as exc:
             last_exc = exc
             if attempt < MAX_RETRIES - 1:
+                logger.warning(
+                    "Gmail API transient network error type=%s attempt=%s; backing off %.1fs",
+                    type(exc).__name__,
+                    attempt + 1,
+                    delay,
+                )
                 time.sleep(delay)
                 delay = min(delay * 2, 30)
                 continue

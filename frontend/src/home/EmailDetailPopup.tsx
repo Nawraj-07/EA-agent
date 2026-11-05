@@ -1,6 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import DraftPanel from "../DraftPanel";
+import EmailGlanceTabs from "./EmailGlanceTabs";
+import EmailReading from "./EmailReading";
+import { extractMeetingUrl } from "./meetingLink";
 
 export type PopupEmailAnalysis = {
   summary: string;
@@ -37,10 +40,21 @@ type EmailDetailPopupProps = {
   analysis: PopupEmailAnalysis | null;
   analysisPending: boolean;
   analysisFailed: boolean;
+  analysisError?: string;
+  onRequestAnalysis?: () => void;
   formatTime: (
     internalDate: number | null | undefined,
     fallback: string | null
   ) => string;
+  /** When opening from chat "Open draft", land on the Draft tab. */
+  initialTab?: MailTab;
+  /** Chatbot-created draft to show on the Draft tab with the same body. */
+  initialDraft?: {
+    id: string;
+    email_id: string;
+    body: string;
+    status: string;
+  } | null;
 };
 
 function parseSender(raw: string | null | undefined): {
@@ -86,13 +100,37 @@ export default function EmailDetailPopup({
   analysis,
   analysisPending,
   analysisFailed,
+  analysisError,
+  onRequestAnalysis,
   formatTime,
+  initialTab,
+  initialDraft = null,
 }: EmailDetailPopupProps) {
-  const [tab, setTab] = useState<MailTab>("summary");
+  const [tab, setTab] = useState<MailTab>(initialTab || "summary");
   const [autoGenerateToken, setAutoGenerateToken] = useState(0);
 
   const conversationKey =
     selectedEmail?.gmail_thread_id || selectedEmail?.id || "";
+  const glanceEmail = selectedEmail
+    ? {
+        sender: selectedEmail.sender,
+        subject: selectedEmail.subject,
+        snippet: selectedEmail.snippet,
+        body: selectedEmail.body,
+        email_analyses: analysis ?? selectedEmail.email_analyses,
+      }
+    : null;
+  const meetingUrl = useMemo(
+    () =>
+      selectedEmail
+        ? extractMeetingUrl(
+            selectedEmail.subject,
+            selectedEmail.snippet,
+            selectedEmail.body
+          )
+        : null,
+    [selectedEmail]
+  );
 
   useEffect(() => {
     if (!open) return;
@@ -115,8 +153,8 @@ export default function EmailDetailPopup({
 
   useEffect(() => {
     if (!open) return;
-    setTab("summary");
-  }, [open, conversationKey]);
+    setTab(initialTab || "summary");
+  }, [open, conversationKey, initialTab]);
 
   useEffect(() => {
     setAutoGenerateToken(0);
@@ -188,6 +226,12 @@ export default function EmailDetailPopup({
             </div>
           ) : (
             <>
+              <div className="home-mail-glance-head">
+                <h3 className="home-mail-subject">
+                  {selectedEmail.subject || "No Subject"}
+                </h3>
+                {glanceEmail ? <EmailGlanceTabs email={glanceEmail} /> : null}
+              </div>
               <div className="home-mail-tabs" role="tablist" aria-label="Mail details">
                 <button
                   type="button"
@@ -234,36 +278,56 @@ export default function EmailDetailPopup({
                 <div className="home-ai-box">
                   <h3>
                     <span aria-hidden>✦</span> AI Summary
-                    {analysis?.importance && (
-                      <span
-                        className={`home-badge ${analysis.importance.toLowerCase()}`}
-                      >
-                        {analysis.importance}
-                      </span>
-                    )}
+                    {glanceEmail ? (
+                      <EmailGlanceTabs email={glanceEmail} />
+                    ) : null}
                   </h3>
                   <p>
                     {analysis?.summary ||
-                      (analysisFailed
-                        ? "Analysis failed. It will be retried on the next sync."
-                        : "Analyzing this email…")}
+                      (analysisPending
+                        ? "Analyzing this email…"
+                        : analysisFailed
+                          ? "Analysis failed. You can retry, or wait for the next recent-mail sync."
+                          : "No AI summary yet. Generate one when you need it — the original email is below.")}
                   </p>
+                  {meetingUrl ? (
+                    <p className="home-meeting-link">
+                      <span className="home-meeting-link-label">Meeting link</span>
+                      <a
+                        href={meetingUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        {meetingUrl}
+                      </a>
+                    </p>
+                  ) : null}
+                  {analysisError ? (
+                    <p className="home-error">{analysisError}</p>
+                  ) : null}
+                  {!analysis && onRequestAnalysis ? (
+                    <button
+                      type="button"
+                      className="home-mail-generate"
+                      onClick={onRequestAnalysis}
+                      disabled={analysisPending}
+                    >
+                      <span aria-hidden>✦</span>{" "}
+                      {analysisFailed ? "Retry AI Summary" : "Generate AI Summary"}
+                    </button>
+                  ) : null}
                 </div>
 
                 <div className="home-analysis-grid home-mail-insights">
-                  <div className="home-mail-insight category">
+                  <div className="home-mail-insight labels">
                     <span className="home-mail-insight-label">
-                      <span aria-hidden>📁</span> Category
+                      <span aria-hidden>🏷️</span> Labels
                     </span>
-                    <strong>{insightValue(analysis?.category)}</strong>
-                  </div>
-                  <div className="home-mail-insight importance">
-                    <span className="home-mail-insight-label">
-                      <span aria-hidden>📊</span> Importance
-                    </span>
-                    <strong>
-                      {insightValue(analysis?.importance)}
-                    </strong>
+                    {glanceEmail ? (
+                      <EmailGlanceTabs email={glanceEmail} />
+                    ) : (
+                      <strong>{insightValue(null)}</strong>
+                    )}
                   </div>
                   <div className="home-mail-insight action">
                     <span className="home-mail-insight-label">
@@ -281,9 +345,7 @@ export default function EmailDetailPopup({
 
                 <details className="home-mail-original" open>
                   <summary>Original Email (Latest)</summary>
-                  <div className="home-mail-original-body">
-                    {fullEmailText(selectedEmail)}
-                  </div>
+                  <EmailReading text={fullEmailText(selectedEmail)} />
                 </details>
 
                 <button
@@ -352,12 +414,21 @@ export default function EmailDetailPopup({
                 className="home-mail-panel"
               >
                 <DraftPanel
-                  key={selectedEmail.id}
+                  key={`${selectedEmail.id}:${initialDraft?.id || "none"}`}
                   emailId={selectedEmail.id}
                   sender={selectedEmail.sender}
                   embedded
                   autoGenerateToken={tab === "draft" ? autoGenerateToken : 0}
+                  initialDraft={
+                    initialDraft && initialDraft.email_id === selectedEmail.id
+                      ? initialDraft
+                      : null
+                  }
                 />
+                <details className="home-mail-original">
+                  <summary>Original Email (Latest)</summary>
+                  <EmailReading text={fullEmailText(selectedEmail)} />
+                </details>
               </div>
             </>
           )}

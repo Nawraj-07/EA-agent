@@ -9,8 +9,15 @@ from zoneinfo import ZoneInfo
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel, Field
 
+from briefing_structure import (
+    BriefingContent,
+    extract_analysis_deadlines,
+    hydrate_briefing_payload,
+    looks_eventish,
+    parse_calendar_invite,
+    received_iso,
+)
 from db import (
     list_briefings_since,
     list_emails_for_briefing,
@@ -23,17 +30,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BRIEFING_TIMEZONE = "Asia/Kolkata"
 HISTORY_PRIOR_DAYS = 7  # today + 7 prior = 8 calendar days
-
-
-class BriefingContent(BaseModel):
-    headline: str = Field(..., min_length=1)
-    highlights: list[str] = Field(default_factory=list)
-    deadlines: list[str] = Field(default_factory=list)
-    action_items: list[str] = Field(default_factory=list)
-    notes: str = Field(
-        default="",
-        description="Short note when inbox is quiet or context is limited",
-    )
+EVENT_LOOKBACK_DAYS = 14
 
 
 def _env_int(name: str, default: int) -> int:
@@ -231,18 +228,27 @@ def parse_target_briefing_date(value: str | date | None) -> date:
 
 
 def _resolve_briefing_account() -> str | None:
-    """Connected Gmail address for scoping saved briefings."""
+    """Account used to load stored emails and save briefings.
+
+    Prefer the live Gmail profile. If the token cannot refresh, use the
+    allowlisted mailbox so briefing still runs from Supabase (same fallback
+    as inbox/chat).
+    """
     try:
         from gmail_sync import get_profile_email
         from main import load_gmail_credentials
 
         return get_profile_email(load_gmail_credentials())
     except Exception as exc:
+        from gmail_safety import get_allowed_gmail_account
+
+        allowed = get_allowed_gmail_account()
         logger.warning(
-            "Could not resolve Gmail account for briefing save: %s",
+            "Live Gmail unavailable for briefing (%s); using stored mailbox %s",
             type(exc).__name__,
+            allowed,
         )
-        return None
+        return allowed or None
 
 
 def _analysis_from_email(email: dict) -> dict:
@@ -252,29 +258,62 @@ def _analysis_from_email(email: dict) -> dict:
     return analyses if isinstance(analyses, dict) else {}
 
 
-def _build_context(emails: list[dict]) -> str:
+def _build_context(emails: list[dict], zone: ZoneInfo | None = None) -> str:
     parts: list[str] = []
     for index, email in enumerate(emails, start=1):
         analysis = _analysis_from_email(email)
         deadlines = analysis.get("deadlines") or []
+        body = str(email.get("body") or "")
+        excerpt = body[:700] if looks_eventish(email) else ""
         parts.append(
             f"""
 Email {index}
+ID: {email.get("id") or ""}
 Subject: {email.get("subject") or ""}
 Sender: {email.get("sender") or ""}
-Date: {email.get("received_at") or ""}
+Received: {received_iso(email, zone or get_briefing_tz())}
 Importance: {analysis.get("importance") or "unknown"}
 Category: {analysis.get("category") or "unknown"}
 Action required: {analysis.get("action_required")}
 Summary: {analysis.get("summary") or ""}
-Deadlines: {deadlines}
+Stored deadlines: {deadlines}
 Snippet: {(email.get("snippet") or "")[:400]}
+Body excerpt: {excerpt}
 """
         )
     return "\n---\n".join(parts)
 
 
-def generate_briefing_content(emails: list[dict]) -> BriefingContent:
+def _merge_briefing_emails(
+    day_emails: list[dict], lookback_emails: list[dict], limit: int
+) -> list[dict]:
+    ordered: list[dict] = []
+    seen: set[str] = set()
+    for email in day_emails:
+        key = str(email.get("id") or "")
+        if key:
+            seen.add(key)
+        ordered.append(email)
+    cap = max(limit, 40)
+    for email in lookback_emails:
+        if len(ordered) >= cap:
+            break
+        key = str(email.get("id") or "")
+        if key and key in seen:
+            continue
+        if looks_eventish(email) or _analysis_from_email(email).get("deadlines"):
+            if key:
+                seen.add(key)
+            ordered.append(email)
+    return ordered
+
+
+def generate_briefing_content(
+    emails: list[dict],
+    *,
+    briefing_day: date | None = None,
+    smart: bool = False,
+) -> BriefingContent:
     if not emails:
         return BriefingContent(
             headline="Quiet inbox",
@@ -282,11 +321,29 @@ def generate_briefing_content(emails: list[dict]) -> BriefingContent:
             deadlines=[],
             action_items=[],
             notes="No saved emails in the briefing window.",
+            items=[],
+            meetings=[],
+            upcoming_deadlines=[],
         )
 
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("OPENAI_API_KEY is missing")
+
+    day = briefing_day or datetime.now(timezone.utc).date()
+    target = day.isoformat()
+    ordered_emails = emails
+    ranking_block = ""
+    if smart:
+        from briefing_priority import (
+            order_emails_by_priority,
+            ranking_context_for_prompt,
+        )
+
+        ordered_emails = order_emails_by_priority(emails, briefing_day=day)
+        ranking_block = ranking_context_for_prompt(
+            ordered_emails, briefing_day=day
+        )
 
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     llm = ChatOpenAI(
@@ -295,22 +352,52 @@ def generate_briefing_content(emails: list[dict]) -> BriefingContent:
         temperature=0,
     ).with_structured_output(BriefingContent)
 
-    context = _build_context(emails)
+    context = _build_context(ordered_emails)
+    smart_instructions = ""
+    if smart:
+        smart_instructions = (
+            "\nSmart ranking is enabled. Lead items[] with the ranked "
+            "actionable emails from the ranking block (max 3 leaders), "
+            "preserve high/medium/low priority labels from context, and "
+            "write concise recommended_action text grounded in those emails "
+            "and approaching deadlines. Never invent priorities.\n"
+        )
+
+    human_parts = [
+        f"Create the briefing for {target} (Asia/Kolkata) from these emails:"
+    ]
+    if ranking_block:
+        human_parts.append(ranking_block)
+    human_parts.append(context)
+
     result = llm.invoke(
         [
             SystemMessage(
                 content=(
-                    "You create a concise daily executive briefing from email "
-                    "summaries. Use only the provided context. Do not invent "
-                    "deadlines, senders, or actions. Prefer high-importance and "
-                    "action_required items. Keep lists short (max 5 items each)."
+                    "You create a concise daily executive briefing from stored "
+                    "emails. Use only the provided context. Never invent "
+                    "senders, subjects, dates, meeting times, or deadlines. "
+                    "Prefer high-importance and action_required items.\n"
+                    f"{smart_instructions}"
+                    "For each items[] entry provide: a short title, a 2-3 "
+                    "sentence description grounded in the email, priority "
+                    "(high/medium/low), recommended_action when the user "
+                    "should do something, and source_email_index matching "
+                    "Email N. Keep items to max 6.\n"
+                    "Meetings: extract only meetings, interviews, webinars, "
+                    "or scheduled events whose EVENT date (not received date) "
+                    f"is {target}. Invitation without acceptance is tentative. "
+                    "Use cancelled/rescheduled/confirmed when the email says so. "
+                    "Leave start_time empty if unknown. Max 8 meetings.\n"
+                    "Upcoming deadlines: only personal obligations with a "
+                    "specific due date supported by the email. Skip newsletter "
+                    "article dates and vague phrases. Exclude dates before "
+                    f"{target} unless the email marks them overdue.\n"
+                    "Also fill highlights, deadlines, and action_items with "
+                    "short strings for compatibility. Do not copy whole emails."
                 )
             ),
-            HumanMessage(
-                content=(
-                    f"Create today's briefing from these emails:\n\n{context}"
-                )
-            ),
+            HumanMessage(content="\n\n".join(human_parts)),
         ]
     )
     return result
@@ -389,12 +476,13 @@ def run_daily_briefing(target_date: date | str | None = None) -> dict:
             from main import load_gmail_credentials
             from scheduler import ingest_inbox_for_local_day
 
+            credentials = load_gmail_credentials()
             logger.info(
                 "No local emails for %s; ingesting that day's INBOX from Gmail",
                 briefing_day.isoformat(),
             )
             ingest_inbox_for_local_day(
-                load_gmail_credentials(),
+                credentials,
                 account,
                 briefing_day,
             )
@@ -404,10 +492,11 @@ def run_daily_briefing(target_date: date | str | None = None) -> dict:
                 end_ms=end_ms,
                 limit=max_emails,
             )
-        except Exception:
-            logger.exception(
-                "Gmail day ingest for briefing failed date=%s",
+        except Exception as exc:
+            logger.info(
+                "Skipping Gmail day ingest for briefing date=%s (%s)",
                 briefing_day.isoformat(),
+                type(exc).__name__,
             )
 
     # Today-only: preserve lookback + newest-mail fallback for first-run UX.
@@ -447,6 +536,52 @@ def run_daily_briefing(target_date: date | str | None = None) -> dict:
                 stats["status"] = "load_failed"
                 return stats
 
+    lookback_emails: list[dict] = []
+    lookback_start = datetime.combine(
+        briefing_day - timedelta(days=EVENT_LOOKBACK_DAYS),
+        datetime.min.time(),
+        tzinfo=zone,
+    )
+    try:
+        lookback_emails = list_emails_for_briefing_day(
+            gmail_account_email=account,
+            start_ms=int(lookback_start.timestamp() * 1000),
+            end_ms=end_ms,
+            limit=max(80, max_emails * 2),
+        )
+    except Exception:
+        logger.exception(
+            "Daily briefing event lookback load failed date=%s",
+            briefing_day.isoformat(),
+        )
+        lookback_emails = []
+
+    llm_emails = _merge_briefing_emails(emails, lookback_emails, max_emails)
+    scan_emails = lookback_emails or emails
+
+    prefs_payload = None
+    try:
+        from briefing_preferences import (
+            filter_emails_for_preferences,
+            get_preferences_for_account,
+            personalization_enabled,
+        )
+
+        if personalization_enabled():
+            prefs_payload = get_preferences_for_account(account).get("preferences")
+            before = len(llm_emails)
+            llm_emails = filter_emails_for_preferences(llm_emails, prefs_payload)
+            scan_emails = filter_emails_for_preferences(scan_emails, prefs_payload)
+            stats["personalization_enabled"] = True
+            stats["emails_filtered"] = max(0, before - len(llm_emails))
+        else:
+            stats["personalization_enabled"] = False
+    except Exception:
+        logger.exception(
+            "Briefing personalization filter failed; continuing with unfiltered emails"
+        )
+        stats["personalization_fallback"] = "filter"
+
     stats["email_count"] = len(emails)
     logger.info(
         "Daily briefing context ready date=%s email_count=%s used_fallback=%s",
@@ -455,16 +590,50 @@ def run_daily_briefing(target_date: date | str | None = None) -> dict:
         stats["used_fallback"],
     )
 
+    from briefing_priority import (
+        apply_smart_priorities_to_payload,
+        smart_briefing_enabled,
+    )
+
+    smart_enabled = smart_briefing_enabled()
+    stats["smart_briefing_enabled"] = smart_enabled
+    stats["smart_fallback"] = None
+
     try:
-        content = generate_briefing_content(emails)
-    except Exception:
-        logger.exception(
-            "Daily briefing AI generation failed (status=generation_failed "
-            "email_count=%s)",
-            stats["email_count"],
+        content = generate_briefing_content(
+            llm_emails,
+            briefing_day=briefing_day,
+            smart=smart_enabled,
         )
-        stats["status"] = "generation_failed"
-        return stats
+    except Exception:
+        if smart_enabled:
+            logger.exception(
+                "Smart briefing AI generation failed; falling back to "
+                "classic generate_briefing_content"
+            )
+            try:
+                content = generate_briefing_content(
+                    llm_emails,
+                    briefing_day=briefing_day,
+                    smart=False,
+                )
+                stats["smart_fallback"] = "generation"
+            except Exception:
+                logger.exception(
+                    "Daily briefing AI generation failed after smart fallback "
+                    "(status=generation_failed email_count=%s)",
+                    stats["email_count"],
+                )
+                stats["status"] = "generation_failed"
+                return stats
+        else:
+            logger.exception(
+                "Daily briefing AI generation failed (status=generation_failed "
+                "email_count=%s)",
+                stats["email_count"],
+            )
+            stats["status"] = "generation_failed"
+            return stats
 
     if stats["used_fallback"] and emails:
         fallback_note = (
@@ -484,15 +653,130 @@ def run_daily_briefing(target_date: date | str | None = None) -> dict:
         if not content.headline:
             content.headline = f"Quiet day — {briefing_day.isoformat()}"
 
-    payload = {
-        "headline": content.headline,
-        "highlights": content.highlights,
-        "deadlines": content.deadlines,
-        "action_items": content.action_items,
-        "notes": content.notes,
-        "email_count": len(emails),
-        "briefing_date": briefing_day.isoformat(),
-    }
+    extra_meetings = [
+        parsed
+        for email in scan_emails
+        if (parsed := parse_calendar_invite(email))
+    ]
+    extra_deadlines: list[dict] = []
+    for email in scan_emails:
+        extra_deadlines.extend(extract_analysis_deadlines(email, briefing_day))
+
+    payload = hydrate_briefing_payload(
+        content,
+        llm_emails,
+        briefing_day=briefing_day,
+        extra_meetings=extra_meetings,
+        extra_deadlines=extra_deadlines,
+    )
+    payload["email_count"] = len(emails)
+    payload["briefing_date"] = briefing_day.isoformat()
+
+    if smart_enabled:
+        try:
+            payload = apply_smart_priorities_to_payload(
+                payload,
+                llm_emails,
+                briefing_day=briefing_day,
+                account_email=account,
+            )
+        except Exception:
+            logger.exception(
+                "Smart priority ranking failed; keeping classic hydrated "
+                "briefing payload (single save, no duplicate row)"
+            )
+            if not stats.get("smart_fallback"):
+                stats["smart_fallback"] = "ranking"
+
+    from briefing_followup import (
+        apply_pending_replies_to_payload,
+        followup_detection_active,
+        pending_reply_detection_enabled,
+    )
+
+    followup_enabled = followup_detection_active()
+    stats["pending_reply_detection_enabled"] = pending_reply_detection_enabled()
+    stats["followup_detection_active"] = followup_enabled
+    try:
+        from ai_followup_assistant import ai_followup_assistant_enabled
+
+        stats["ai_followup_assistant_enabled"] = ai_followup_assistant_enabled()
+    except Exception:
+        stats["ai_followup_assistant_enabled"] = False
+    stats["pending_reply_fallback"] = None
+    if followup_enabled:
+        try:
+            payload = apply_pending_replies_to_payload(
+                payload,
+                llm_emails,
+                account_email=account,
+                gmail_account_email=account,
+            )
+        except Exception:
+            logger.exception(
+                "Pending-reply detection failed; keeping prior briefing "
+                "payload (single save, no duplicate row)"
+            )
+            stats["pending_reply_fallback"] = "detection"
+
+    try:
+        from briefing_preferences import apply_section_preferences, personalization_enabled
+
+        if personalization_enabled() and prefs_payload:
+            payload = apply_section_preferences(payload, prefs_payload)
+    except Exception:
+        logger.exception(
+            "Section preference apply failed; keeping prior briefing payload"
+        )
+        stats["personalization_fallback"] = "sections"
+
+    try:
+        from briefing_feedback import (
+            filter_validated_recommendations,
+            feedback_enabled,
+            suppressed_recommendation_keys,
+        )
+        from briefing_preferences import personalization_enabled as _pers_on
+        from briefing_recommendations import _stable_key
+
+        if feedback_enabled() or _pers_on():
+            known_ids = {
+                str(e.get("id"))
+                for e in llm_emails
+                if isinstance(e, dict) and e.get("id")
+            }
+            suppressed = suppressed_recommendation_keys(account)
+            candidates = []
+            for item in payload.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                key = _stable_key(
+                    account,
+                    "briefing_item",
+                    str(item.get("source_email_id") or ""),
+                    str(item.get("title") or ""),
+                    str(item.get("kind") or "action"),
+                )
+                if key in suppressed:
+                    continue
+                row_item = dict(item)
+                row_item["recommendation_key"] = key
+                row_item["source_type"] = "briefing_item"
+                candidates.append(row_item)
+            kept, val_stats = filter_validated_recommendations(
+                candidates,
+                account_email=account,
+                known_email_ids=known_ids,
+                seen_keys=set(),
+            )
+            payload = dict(payload)
+            payload["items"] = kept
+            stats["recommendation_validation"] = val_stats
+    except Exception:
+        logger.exception(
+            "Recommendation validation failed; keeping prior items (no duplicate save)"
+        )
+        stats["feedback_fallback"] = "validation"
 
     try:
         row = save_briefing(
@@ -516,6 +800,24 @@ def run_daily_briefing(target_date: date | str | None = None) -> dict:
             stats["email_count"],
             stats["used_fallback"],
         )
+        try:
+            from whatsapp_notifications import (
+                notify_whatsapp_daily_briefing,
+                notify_whatsapp_meeting_and_payment_from_briefing,
+            )
+
+            wa_stats = notify_whatsapp_daily_briefing(stats, payload)
+            stats["whatsapp"] = wa_stats
+            meeting_wa = notify_whatsapp_meeting_and_payment_from_briefing(
+                payload,
+                briefing_day=briefing_day,
+            )
+            stats["whatsapp_meetings_payments"] = meeting_wa
+        except Exception:
+            logger.exception(
+                "WhatsApp notify after briefing save failed "
+                "(briefing remains saved)"
+            )
     except Exception as exc:
         logger.exception(
             "Daily briefing failed while saving to database "

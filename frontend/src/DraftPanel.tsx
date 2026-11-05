@@ -15,6 +15,8 @@ type DraftPanelProps = {
   sender?: string | null;
   embedded?: boolean;
   autoGenerateToken?: number;
+  /** Prefill from chatbot-created draft (same id/body). */
+  initialDraft?: Draft | null;
 };
 
 function isNoReplyBody(body: string | undefined | null): boolean {
@@ -70,9 +72,22 @@ export default function DraftPanel({
   sender,
   embedded = false,
   autoGenerateToken = 0,
+  initialDraft = null,
 }: DraftPanelProps) {
-  const [draft, setDraft] = useState<Draft | null>(null);
-  const [draftBody, setDraftBody] = useState("");
+  const [draft, setDraft] = useState<Draft | null>(() =>
+    initialDraft &&
+    initialDraft.email_id === emailId &&
+    initialDraft.body?.trim()
+      ? initialDraft
+      : null
+  );
+  const [draftBody, setDraftBody] = useState(() =>
+    initialDraft &&
+    initialDraft.email_id === emailId &&
+    initialDraft.body?.trim()
+      ? initialDraft.body
+      : ""
+  );
   const [loading, setLoading] = useState(false);
   const [actionLoading, setActionLoading] = useState(false);
   const [sending, setSending] = useState(false);
@@ -80,6 +95,18 @@ export default function DraftPanel({
   const [info, setInfo] = useState("");
   const [success, setSuccess] = useState("");
   const [showConfirm, setShowConfirm] = useState(false);
+
+  useEffect(() => {
+    if (!initialDraft || initialDraft.email_id !== emailId) return;
+    if (!initialDraft.body?.trim() && !initialDraft.id) return;
+    setDraft(initialDraft);
+    if (initialDraft.body?.trim()) {
+      setDraftBody(initialDraft.body);
+    }
+    setError("");
+    setInfo("");
+    setSuccess("");
+  }, [emailId, initialDraft?.id, initialDraft?.body, initialDraft?.email_id]);
 
   const statusValue = draft?.status?.toLowerCase() || "";
   const isPending = statusValue === "pending";
@@ -154,6 +181,32 @@ export default function DraftPanel({
     if (draftRef.current || busyRef.current) return;
     void generateDraftRef.current();
   }, [autoGenerateToken]);
+
+  useEffect(() => {
+    if (
+      !initialDraft?.id ||
+      initialDraft.email_id !== emailId ||
+      initialDraft.body?.trim()
+    ) {
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const response = await fetch(`${API}/drafts/${initialDraft.id}`);
+        if (!response.ok || cancelled) return;
+        const data = (await response.json()) as Draft;
+        if (cancelled || !data?.body) return;
+        setDraft(data);
+        setDraftBody(data.body);
+      } catch {
+        /* keep empty until Generate */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [emailId, initialDraft?.id, initialDraft?.email_id, initialDraft?.body]);
 
   async function patchDraft(payload: { body?: string; status?: string }) {
     if (!draft || busy) return;

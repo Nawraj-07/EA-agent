@@ -1,6 +1,7 @@
 import os
+import re
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 from supabase import create_client
@@ -219,20 +220,44 @@ def mark_analysis_failed(email_id: str) -> None:
     )
 
 
+def auto_analyze_cutoff_ms(now: datetime | None = None) -> int | None:
+    """Oldest internal_date the analysis queue will pick (None = no cutoff)."""
+    raw = os.getenv("GMAIL_AUTO_ANALYZE_NEWER_THAN_DAYS", "2")
+    try:
+        days = int(raw)
+    except ValueError:
+        days = 2
+    if days <= 0:
+        return None
+    stamp = now or datetime.now(timezone.utc)
+    cutoff = stamp - timedelta(days=days)
+    return int(cutoff.timestamp() * 1000)
+
+
 def list_pending_analysis_emails(
     *,
     gmail_account_email: str,
     limit: int = 20,
     statuses: list[str] | None = None,
+    min_internal_date_ms: int | None | object = ...,
 ) -> list:
     client = get_supabase_client()
     allowed = statuses or ["pending", "failed"]
-    response = (
+    cutoff = (
+        auto_analyze_cutoff_ms()
+        if min_internal_date_ms is ...
+        else min_internal_date_ms
+    )
+    query = (
         client.table("emails")
         .select("*")
         .eq("gmail_account_email", gmail_account_email)
         .in_("analysis_status", allowed)
-        .order("internal_date", desc=True)
+    )
+    if cutoff is not None:
+        query = query.gte("internal_date", cutoff)
+    response = (
+        query.order("internal_date", desc=True)
         .limit(limit)
         .execute()
     )
@@ -295,6 +320,130 @@ def get_stored_email(email_id: str):
     return response.data
 
 
+_ILIKE_SAFE = re.compile(r"[^a-zA-Z0-9_-]+")
+
+
+def tokenize_search_keywords(keywords: list[str] | None) -> list[str]:
+    """Split phrases into tokens and drop short stopwords (not an exact phrase)."""
+    stopwords = {
+        "a",
+        "an",
+        "and",
+        "the",
+        "of",
+        "or",
+        "to",
+        "in",
+        "on",
+        "for",
+        "from",
+        "with",
+        "about",
+        "this",
+        "that",
+        "did",
+        "how",
+        "many",
+        "what",
+        "which",
+        "who",
+        "when",
+        "where",
+        "email",
+        "emails",
+        "mail",
+        "mails",
+        "inbox",
+        "please",
+        "me",
+        "my",
+        "i",
+    }
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for raw in keywords or []:
+        for part in _ILIKE_SAFE.split(str(raw).lower()):
+            token = part.strip("-_")
+            if len(token) < 2 or token in stopwords or token in seen:
+                continue
+            seen.add(token)
+            tokens.append(token)
+    return tokens
+
+
+def _escape_ilike_token(token: str) -> str:
+    return token.replace("\\", "").replace("%", "").replace("_", "").replace(",", "")
+
+
+def row_matches_all_tokens(row: dict, tokens: list[str]) -> bool:
+    if not tokens:
+        return True
+    analysis = _first_analysis(row) or {}
+    hay = " ".join(
+        [
+            str(row.get("subject") or ""),
+            str(row.get("snippet") or ""),
+            str(row.get("body") or ""),
+            str(row.get("sender") or ""),
+            str(analysis.get("summary") or ""),
+        ]
+    ).lower()
+    return all(token in hay for token in tokens)
+
+
+def completed_analysis_payload(email: dict | None) -> dict | None:
+    """Return a saved analysis when status is done; otherwise None (no OpenAI)."""
+    if not email:
+        return None
+    if str(email.get("analysis_status") or "") != "done":
+        return None
+    analysis = _first_analysis(email)
+    if not isinstance(analysis, dict) or not analysis.get("summary"):
+        return None
+    return analysis
+
+
+def _apply_chat_row_filters(
+    query,
+    *,
+    gmail_account_email: str | None,
+    sender_contains: str | None,
+    tokens: list[str],
+    internal_date_from_ms: int | None,
+    internal_date_to_ms: int | None,
+    in_inbox_only: bool,
+    importance: str | None = None,
+    action_required: bool | None = None,
+    unread_only: bool = False,
+):
+    if gmail_account_email:
+        query = query.eq("gmail_account_email", gmail_account_email)
+    if in_inbox_only:
+        query = query.eq("in_inbox", True)
+    if unread_only:
+        query = query.contains("label_ids", ["UNREAD"])
+    if sender_contains and sender_contains.strip():
+        query = query.ilike("sender", f"%{sender_contains.strip()}%")
+    if internal_date_from_ms is not None:
+        query = query.gte("internal_date", internal_date_from_ms)
+    if internal_date_to_ms is not None:
+        query = query.lt("internal_date", internal_date_to_ms)
+    if importance:
+        query = query.eq("email_analyses.importance", importance)
+    if action_required is not None:
+        query = query.eq("email_analyses.action_required", action_required)
+    for token in tokens:
+        safe = _escape_ilike_token(token)
+        if not safe:
+            continue
+        query = query.or_(
+            f"subject.ilike.%{safe}%,"
+            f"snippet.ilike.%{safe}%,"
+            f"body.ilike.%{safe}%"
+        )
+    return query
+
+
 def search_emails_for_chat(
     *,
     gmail_account_email: str | None,
@@ -306,24 +455,36 @@ def search_emails_for_chat(
     internal_date_to_ms: int | None = None,
     limit: int = 15,
     in_inbox_only: bool = True,
+    unread_only: bool = False,
 ) -> list:
     """
     Filtered email retrieval for Ask My Inbox (PostgREST filters + in-memory refine).
     """
     client = get_supabase_client()
-    fetch_limit = max(limit * 3, 40)
+    tokens = tokenize_search_keywords(keywords)
+    needs_analysis_filter = importance is not None or action_required is not None
+    # SQL already filters all eligible rows; fetch extra matches so in-memory
+    # refine can rank before the OpenAI context cap.
+    fetch_limit = min(max(limit * 8, 80), 500)
+    select = (
+        "id, email_analyses!inner(*)"
+        if needs_analysis_filter
+        else "*, email_analyses(*)"
+    )
 
-    query = client.table("emails").select("*, email_analyses(*)")
-    if gmail_account_email:
-        query = query.eq("gmail_account_email", gmail_account_email)
-    if in_inbox_only:
-        query = query.eq("in_inbox", True)
-    if sender_contains:
-        query = query.ilike("sender", f"%{sender_contains.strip()}%")
-    if internal_date_from_ms is not None:
-        query = query.gte("internal_date", internal_date_from_ms)
-    if internal_date_to_ms is not None:
-        query = query.lt("internal_date", internal_date_to_ms)
+    query = client.table("emails").select(select)
+    query = _apply_chat_row_filters(
+        query,
+        gmail_account_email=gmail_account_email,
+        sender_contains=sender_contains,
+        tokens=tokens,
+        internal_date_from_ms=internal_date_from_ms,
+        internal_date_to_ms=internal_date_to_ms,
+        in_inbox_only=in_inbox_only,
+        importance=importance,
+        action_required=action_required,
+        unread_only=unread_only,
+    )
 
     rows = (
         query.order("internal_date", desc=True)
@@ -333,32 +494,15 @@ def search_emails_for_chat(
         or []
     )
 
-    keywords_norm = [k.strip().lower() for k in (keywords or []) if k and k.strip()]
-
-    def _analysis(row: dict) -> dict:
-        analyses = row.get("email_analyses") or []
-        if isinstance(analyses, list):
-            return analyses[0] if analyses else {}
-        return analyses if isinstance(analyses, dict) else {}
-
     filtered: list = []
     for row in rows:
-        analysis = _analysis(row)
+        analysis = _first_analysis(row) or {}
         if importance and (analysis.get("importance") or "").lower() != importance.lower():
             continue
         if action_required is not None and bool(analysis.get("action_required")) != action_required:
             continue
-        if keywords_norm:
-            hay = " ".join(
-                [
-                    str(row.get("subject") or ""),
-                    str(row.get("snippet") or ""),
-                    str(row.get("body") or "")[:2000],
-                    str(analysis.get("summary") or ""),
-                ]
-            ).lower()
-            if not any(k in hay for k in keywords_norm):
-                continue
+        if not row_matches_all_tokens(row, tokens):
+            continue
         filtered.append(row)
         if len(filtered) >= limit:
             break
@@ -366,7 +510,46 @@ def search_emails_for_chat(
     return filtered
 
 
-def _first_analysis(row: dict):
+def count_emails_for_chat(
+    *,
+    gmail_account_email: str | None,
+    sender_contains: str | None = None,
+    keywords: list[str] | None = None,
+    importance: str | None = None,
+    action_required: bool | None = None,
+    internal_date_from_ms: int | None = None,
+    internal_date_to_ms: int | None = None,
+    in_inbox_only: bool = True,
+    unread_only: bool = False,
+) -> int:
+    """Postgres COUNT of stored Inbox rows matching the same chat filters."""
+    client = get_supabase_client()
+    tokens = tokenize_search_keywords(keywords)
+    needs_analysis_filter = importance is not None or action_required is not None
+    select = "id, email_analyses!inner(importance, action_required)" if needs_analysis_filter else "id"
+    query = client.table("emails").select(select, count="exact")
+    query = _apply_chat_row_filters(
+        query,
+        gmail_account_email=gmail_account_email,
+        sender_contains=sender_contains,
+        tokens=tokens,
+        internal_date_from_ms=internal_date_from_ms,
+        internal_date_to_ms=internal_date_to_ms,
+        in_inbox_only=in_inbox_only,
+        importance=importance,
+        action_required=action_required,
+        unread_only=unread_only,
+    )
+    response = query.limit(0).execute()
+    counted = getattr(response, "count", None)
+    if counted is not None:
+        return int(counted)
+    return len(response.data or [])
+
+
+def _first_analysis(row: dict | None):
+    if not row:
+        return None
     analyses = row.get("email_analyses")
     if isinstance(analyses, list):
         return analyses[0] if analyses else None
@@ -931,6 +1114,30 @@ def get_latest_briefing(gmail_account_email: str | None = None):
     return response.data[0]
 
 
+def get_briefing_for_date(
+    *,
+    gmail_account_email: str,
+    briefing_date: str,
+) -> dict | None:
+    """Latest saved briefing row for one calendar day (briefing_date)."""
+    if not gmail_account_email or not briefing_date:
+        return None
+
+    client = get_supabase_client()
+    response = (
+        client.table("daily_briefings")
+        .select("*")
+        .eq("gmail_account_email", gmail_account_email)
+        .eq("briefing_date", briefing_date)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if not response.data:
+        return None
+    return response.data[0]
+
+
 def list_briefings_since(
     *,
     gmail_account_email: str,
@@ -959,3 +1166,690 @@ def list_briefings_since(
 
     response = query.order("created_at", desc=True).execute()
     return response.data or []
+
+def claim_whatsapp_outbox_row(
+    *,
+    notification_type: str,
+    recipient: str,
+    source_id: str,
+    template_name: str,
+    template_language: str = "en_US",
+    payload_summary: dict | None = None,
+) -> dict | None:
+    """Insert a queued outbox row. Returns None if the unique key already exists."""
+    recipient_clean = (recipient or "").strip()
+    source = (source_id or "").strip()
+    if not recipient_clean or not source or not notification_type or not template_name:
+        raise ValueError("whatsapp outbox requires type, recipient, source_id, template")
+
+    client = get_supabase_client()
+    existing = (
+        client.table("whatsapp_notification_outbox")
+        .select("id,status,meta_message_id,retry_count")
+        .eq("notification_type", notification_type)
+        .eq("source_id", source)
+        .eq("recipient", recipient_clean)
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        return None
+
+    row = {
+        "notification_type": notification_type,
+        "recipient": recipient_clean,
+        "source_id": source,
+        "template_name": template_name,
+        "template_language": template_language or "en_US",
+        "status": "queued",
+        "payload_summary": payload_summary or {},
+        "retry_count": 0,
+        "created_at": _utcnow(),
+    }
+    result = (
+        client.table("whatsapp_notification_outbox")
+        .insert(row)
+        .execute()
+    )
+    if not result.data:
+        raise RuntimeError("Failed to insert whatsapp_notification_outbox row")
+    return result.data[0]
+
+
+def update_whatsapp_outbox_status(
+    outbox_id: str,
+    *,
+    status: str,
+    meta_message_id: str | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    increment_retry: bool = False,
+) -> dict | None:
+    if not outbox_id:
+        return None
+    client = get_supabase_client()
+    updates: dict = {
+        "status": status,
+        "error_code": error_code,
+        "error_message": (error_message or None) and str(error_message)[:500],
+    }
+    if meta_message_id:
+        updates["meta_message_id"] = meta_message_id
+    if status in {"accepted", "sent"}:
+        updates["sent_at"] = _utcnow()
+    if status == "delivered":
+        updates["delivered_at"] = _utcnow()
+
+    if increment_retry:
+        current = (
+            client.table("whatsapp_notification_outbox")
+            .select("retry_count")
+            .eq("id", outbox_id)
+            .limit(1)
+            .execute()
+        )
+        prior = 0
+        if current.data:
+            prior = int(current.data[0].get("retry_count") or 0)
+        updates["retry_count"] = prior + 1
+
+    result = (
+        client.table("whatsapp_notification_outbox")
+        .update(updates)
+        .eq("id", outbox_id)
+        .select("*")
+        .execute()
+    )
+    return result.data[0] if result.data else None
+
+
+def list_whatsapp_outbox_for_flush(
+    *,
+    statuses: list[str] | None = None,
+    limit: int = 20,
+    max_retries: int = 3,
+) -> list[dict]:
+    client = get_supabase_client()
+    wanted = statuses or ["queued", "failed", "rate_limited"]
+    response = (
+        client.table("whatsapp_notification_outbox")
+        .select("*")
+        .in_("status", wanted)
+        .lt("retry_count", max_retries)
+        .order("created_at", desc=False)
+        .limit(max(1, min(limit, 100)))
+        .execute()
+    )
+    return response.data or []
+
+
+def list_emails_for_briefing_range(
+    *,
+    gmail_account_email: str,
+    start_ms: int,
+    end_ms: int,
+    limit: int = 120,
+) -> list:
+    """Emails whose Gmail internal_date falls in [start_ms, end_ms)."""
+    if not gmail_account_email:
+        return []
+    client = get_supabase_client()
+    response = (
+        client.table("emails")
+        .select("*, email_analyses(*)")
+        .eq("gmail_account_email", gmail_account_email)
+        .gte("internal_date", start_ms)
+        .lt("internal_date", end_ms)
+        .order("internal_date", desc=True)
+        .limit(max(1, min(int(limit), 300)))
+        .execute()
+    )
+    return response.data or []
+
+
+def upsert_smart_briefing_mode_run(
+    *,
+    gmail_account_email: str,
+    mode: str,
+    period_key: str,
+    period_start: str,
+    period_end: str,
+    content: dict,
+    email_count: int,
+    status: str = "saved",
+    error_message: str | None = None,
+) -> dict:
+    """Insert or update one mode run (unique on account+mode+period_key)."""
+    if not gmail_account_email or not mode or not period_key:
+        raise ValueError("account, mode, and period_key are required")
+
+    client = get_supabase_client()
+    now = datetime.now(timezone.utc).isoformat()
+    row = {
+        "gmail_account_email": gmail_account_email,
+        "mode": mode,
+        "period_key": period_key,
+        "period_start": period_start,
+        "period_end": period_end,
+        "content": content or {},
+        "email_count": int(email_count or 0),
+        "status": status,
+        "error_message": error_message,
+        "updated_at": now,
+    }
+    result = (
+        client.table("smart_briefing_mode_runs")
+        .upsert(row, on_conflict="gmail_account_email,mode,period_key")
+        .execute()
+    )
+    if not result.data:
+        raise RuntimeError("Failed to upsert smart_briefing_mode_runs row")
+    return result.data[0]
+
+
+def get_latest_smart_briefing_mode_run(
+    *,
+    gmail_account_email: str,
+    mode: str,
+) -> dict | None:
+    if not gmail_account_email or not mode:
+        return None
+    client = get_supabase_client()
+    response = (
+        client.table("smart_briefing_mode_runs")
+        .select("*")
+        .eq("gmail_account_email", gmail_account_email)
+        .eq("mode", mode)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return response.data[0] if response.data else None
+
+
+def list_smart_briefing_mode_runs(
+    *,
+    gmail_account_email: str,
+    mode: str,
+    limit: int = 14,
+) -> list:
+    if not gmail_account_email or not mode:
+        return []
+    client = get_supabase_client()
+    response = (
+        client.table("smart_briefing_mode_runs")
+        .select("*")
+        .eq("gmail_account_email", gmail_account_email)
+        .eq("mode", mode)
+        .order("created_at", desc=True)
+        .limit(max(1, min(int(limit), 60)))
+        .execute()
+    )
+    return response.data or []
+
+
+def list_recommendation_states_for_account(
+    *,
+    gmail_account_email: str,
+) -> list:
+    """All recommendation state rows for one Gmail account."""
+    if not gmail_account_email:
+        return []
+    client = get_supabase_client()
+    response = (
+        client.table("briefing_recommendation_state")
+        .select("*")
+        .eq("gmail_account_email", gmail_account_email)
+        .order("updated_at", desc=True)
+        .execute()
+    )
+    return response.data or []
+
+
+def get_recommendation_state(
+    *,
+    gmail_account_email: str,
+    recommendation_key: str,
+) -> dict | None:
+    if not gmail_account_email or not recommendation_key:
+        return None
+    client = get_supabase_client()
+    response = (
+        client.table("briefing_recommendation_state")
+        .select("*")
+        .eq("gmail_account_email", gmail_account_email)
+        .eq("recommendation_key", recommendation_key)
+        .limit(1)
+        .execute()
+    )
+    return response.data[0] if response.data else None
+
+
+def upsert_recommendation_state(
+    *,
+    gmail_account_email: str,
+    source_type: str,
+    source_id: str,
+    recommendation_key: str,
+    status: str,
+    snoozed_until: str | None = None,
+    title: str | None = None,
+    action_type: str | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """Insert or update one recommendation state row (account + key unique)."""
+    if not gmail_account_email or not recommendation_key:
+        raise ValueError("account and recommendation_key are required")
+
+    client = get_supabase_client()
+    now = datetime.now(timezone.utc).isoformat()
+    row = {
+        "gmail_account_email": gmail_account_email,
+        "source_type": source_type or "briefing_item",
+        "source_id": source_id or recommendation_key,
+        "recommendation_key": recommendation_key,
+        "status": status,
+        "snoozed_until": snoozed_until,
+        "title": title,
+        "action_type": action_type,
+        "metadata": metadata or {},
+        "updated_at": now,
+    }
+    result = (
+        client.table("briefing_recommendation_state")
+        .upsert(row, on_conflict="gmail_account_email,recommendation_key")
+        .execute()
+    )
+    if not result.data:
+        raise RuntimeError("Failed to upsert briefing_recommendation_state row")
+    return result.data[0]
+
+
+def release_expired_recommendation_snoozes(
+    *,
+    gmail_account_email: str,
+    now_iso: str,
+) -> int:
+    """
+    Move expired snoozed rows back to pending for one account.
+    Returns number of rows updated (best-effort; 0 on empty).
+    """
+    if not gmail_account_email:
+        return 0
+    client = get_supabase_client()
+    existing = (
+        client.table("briefing_recommendation_state")
+        .select("id,recommendation_key,snoozed_until")
+        .eq("gmail_account_email", gmail_account_email)
+        .eq("status", "snoozed")
+        .lte("snoozed_until", now_iso)
+        .execute()
+    )
+    rows = existing.data or []
+    if not rows:
+        return 0
+    updated = 0
+    now = datetime.now(timezone.utc).isoformat()
+    for row in rows:
+        client.table("briefing_recommendation_state").update(
+            {
+                "status": "pending",
+                "snoozed_until": None,
+                "updated_at": now,
+            }
+        ).eq("id", row["id"]).eq(
+            "gmail_account_email", gmail_account_email
+        ).execute()
+        updated += 1
+    return updated
+
+
+def get_briefing_preferences(*, gmail_account_email: str) -> dict | None:
+    if not gmail_account_email:
+        return None
+    client = get_supabase_client()
+    response = (
+        client.table("briefing_preferences")
+        .select("*")
+        .eq("gmail_account_email", gmail_account_email)
+        .limit(1)
+        .execute()
+    )
+    return response.data[0] if response.data else None
+
+
+def upsert_briefing_preferences(
+    *,
+    gmail_account_email: str,
+    preferences: dict,
+) -> dict:
+    if not gmail_account_email:
+        raise ValueError("gmail_account_email is required")
+    client = get_supabase_client()
+    now = datetime.now(timezone.utc).isoformat()
+    row = {
+        "gmail_account_email": gmail_account_email,
+        "timezone": preferences.get("timezone") or "Asia/Kolkata",
+        "working_days": preferences.get("working_days") or [1, 2, 3, 4, 5],
+        "working_hours": preferences.get("working_hours")
+        or {"start": "09:00", "end": "18:00"},
+        "briefing_sections": preferences.get("briefing_sections") or {},
+        "vip_contacts": preferences.get("vip_contacts") or [],
+        "filtering_preferences": preferences.get("filtering_preferences") or {},
+        "mode_schedules": preferences.get("mode_schedules") or {},
+        "updated_at": now,
+    }
+    result = (
+        client.table("briefing_preferences")
+        .upsert(row, on_conflict="gmail_account_email")
+        .execute()
+    )
+    if not result.data:
+        raise RuntimeError("Failed to upsert briefing_preferences")
+    return result.data[0]
+
+
+def upsert_recommendation_feedback(
+    *,
+    gmail_account_email: str,
+    recommendation_key: str,
+    feedback_type: str,
+    metadata: dict | None = None,
+) -> dict:
+    if not gmail_account_email or not recommendation_key:
+        raise ValueError("account and recommendation_key are required")
+    client = get_supabase_client()
+    now = datetime.now(timezone.utc).isoformat()
+    row = {
+        "gmail_account_email": gmail_account_email,
+        "recommendation_key": recommendation_key,
+        "feedback_type": feedback_type,
+        "metadata": metadata or {},
+        "updated_at": now,
+    }
+    result = (
+        client.table("briefing_recommendation_feedback")
+        .upsert(row, on_conflict="gmail_account_email,recommendation_key")
+        .execute()
+    )
+    if not result.data:
+        raise RuntimeError("Failed to upsert briefing_recommendation_feedback")
+    return result.data[0]
+
+
+def list_recommendation_feedback_for_account(
+    *,
+    gmail_account_email: str,
+) -> list:
+    if not gmail_account_email:
+        return []
+    client = get_supabase_client()
+    response = (
+        client.table("briefing_recommendation_feedback")
+        .select("*")
+        .eq("gmail_account_email", gmail_account_email)
+        .order("updated_at", desc=True)
+        .execute()
+    )
+    return response.data or []
+
+
+def try_claim_briefing_schedule(
+    *,
+    gmail_account_email: str,
+    job_kind: str,
+    period_key: str,
+    metadata: dict | None = None,
+) -> dict | None:
+    """
+    Insert a schedule claim. Returns the row on success, None if already claimed
+    (unique violation / existing row). Safe for multi-instance coordination.
+    """
+    if not gmail_account_email or not job_kind or not period_key:
+        raise ValueError("account, job_kind, and period_key are required")
+    client = get_supabase_client()
+    existing = (
+        client.table("briefing_schedule_claims")
+        .select("id,claimed_at")
+        .eq("gmail_account_email", gmail_account_email)
+        .eq("job_kind", job_kind)
+        .eq("period_key", period_key)
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        return None
+    try:
+        result = (
+            client.table("briefing_schedule_claims")
+            .insert(
+                {
+                    "gmail_account_email": gmail_account_email,
+                    "job_kind": job_kind,
+                    "period_key": period_key,
+                    "metadata": metadata or {},
+                }
+            )
+            .execute()
+        )
+    except Exception:
+        # Race: another instance claimed first
+        return None
+    if not result.data:
+        return None
+    return result.data[0]
+
+
+def get_quality_counters(
+    *,
+    gmail_account_email: str,
+    metric_date: str,
+) -> dict | None:
+    if not gmail_account_email or not metric_date:
+        return None
+    client = get_supabase_client()
+    response = (
+        client.table("briefing_quality_counters")
+        .select("*")
+        .eq("gmail_account_email", gmail_account_email)
+        .eq("metric_date", metric_date)
+        .limit(1)
+        .execute()
+    )
+    return response.data[0] if response.data else None
+
+
+def bump_quality_counter(
+    *,
+    gmail_account_email: str,
+    metric_date: str,
+    metric: str,
+    amount: int = 1,
+) -> dict:
+    if not gmail_account_email or not metric_date or not metric:
+        raise ValueError("account, metric_date, and metric are required")
+    client = get_supabase_client()
+    now = datetime.now(timezone.utc).isoformat()
+    existing = get_quality_counters(
+        gmail_account_email=gmail_account_email,
+        metric_date=metric_date,
+    )
+    metrics = dict((existing or {}).get("metrics") or {})
+    metrics[metric] = int(metrics.get(metric) or 0) + int(amount)
+    row = {
+        "gmail_account_email": gmail_account_email,
+        "metric_date": metric_date,
+        "metrics": metrics,
+        "updated_at": now,
+    }
+    result = (
+        client.table("briefing_quality_counters")
+        .upsert(row, on_conflict="gmail_account_email,metric_date")
+        .execute()
+    )
+    if not result.data:
+        raise RuntimeError("Failed to upsert briefing_quality_counters")
+    return result.data[0]
+
+
+def get_dashboard_visit(*, gmail_account_email: str) -> dict | None:
+    if not gmail_account_email:
+        return None
+    client = get_supabase_client()
+    response = (
+        client.table("briefing_dashboard_visits")
+        .select("*")
+        .eq("gmail_account_email", gmail_account_email)
+        .limit(1)
+        .execute()
+    )
+    return response.data[0] if response.data else None
+
+
+def upsert_dashboard_visit(
+    *,
+    gmail_account_email: str,
+    visited_at_iso: str,
+) -> dict:
+    """
+    Record a meaningful Home visit.
+
+    Moves current last_visit_at → previous_visit_at, then sets last_visit_at.
+    """
+    if not gmail_account_email:
+        raise ValueError("gmail_account_email is required")
+    client = get_supabase_client()
+    existing = get_dashboard_visit(gmail_account_email=gmail_account_email)
+    previous = (existing or {}).get("last_visit_at")
+    now = datetime.now(timezone.utc).isoformat()
+    row = {
+        "gmail_account_email": gmail_account_email,
+        "last_visit_at": visited_at_iso,
+        "previous_visit_at": previous,
+        "updated_at": now,
+        "metadata": (existing or {}).get("metadata") or {},
+    }
+    if not existing:
+        row["created_at"] = now
+    result = (
+        client.table("briefing_dashboard_visits")
+        .upsert(row, on_conflict="gmail_account_email")
+        .execute()
+    )
+    if not result.data:
+        raise RuntimeError("Failed to upsert briefing_dashboard_visits")
+    return result.data[0]
+
+
+def get_catchup_cache(
+    *,
+    gmail_account_email: str,
+    window_key: str,
+) -> dict | None:
+    if not gmail_account_email or not window_key:
+        return None
+    client = get_supabase_client()
+    now = datetime.now(timezone.utc).isoformat()
+    response = (
+        client.table("briefing_catchup_cache")
+        .select("*")
+        .eq("gmail_account_email", gmail_account_email)
+        .eq("window_key", window_key)
+        .gt("expires_at", now)
+        .limit(1)
+        .execute()
+    )
+    return response.data[0] if response.data else None
+
+
+def put_catchup_cache(
+    *,
+    gmail_account_email: str,
+    window_key: str,
+    payload: dict,
+    ttl_minutes: int = 15,
+) -> dict:
+    if not gmail_account_email or not window_key:
+        raise ValueError("account and window_key required")
+    client = get_supabase_client()
+    now = datetime.now(timezone.utc)
+    expires = (now + timedelta(minutes=max(1, int(ttl_minutes)))).isoformat()
+    row = {
+        "gmail_account_email": gmail_account_email,
+        "window_key": window_key,
+        "payload": payload,
+        "expires_at": expires,
+        "created_at": now.isoformat(),
+    }
+    result = (
+        client.table("briefing_catchup_cache")
+        .upsert(row, on_conflict="gmail_account_email,window_key")
+        .execute()
+    )
+    if not result.data:
+        raise RuntimeError("Failed to upsert briefing_catchup_cache")
+    return result.data[0]
+
+
+def get_end_my_day_checkpoint(
+    *,
+    gmail_account_email: str,
+    local_date: str,
+) -> dict | None:
+    """Closing checkpoint for one account and local date. None when absent."""
+    if not gmail_account_email or not local_date:
+        return None
+    client = get_supabase_client()
+    response = (
+        client.table("end_my_day_checkpoints")
+        .select("*")
+        .eq("gmail_account_email", gmail_account_email)
+        .eq("local_date", local_date)
+        .limit(1)
+        .execute()
+    )
+    return response.data[0] if response.data else None
+
+
+def upsert_end_my_day_checkpoint(
+    *,
+    gmail_account_email: str,
+    local_date: str,
+    closed_at: str,
+    timezone_name: str,
+    summary: str,
+    wrapup_source: str,
+    item_refs: list,
+    decisions: list,
+    unresolved: list,
+) -> dict:
+    """Insert or update the closing checkpoint for one account and local date."""
+    if not gmail_account_email or not local_date:
+        raise ValueError("account and local_date are required")
+    client = get_supabase_client()
+    now = datetime.now(timezone.utc).isoformat()
+    existing = get_end_my_day_checkpoint(
+        gmail_account_email=gmail_account_email, local_date=local_date
+    )
+    row = {
+        "gmail_account_email": gmail_account_email,
+        "local_date": local_date,
+        "closed_at": closed_at,
+        "timezone": timezone_name,
+        "summary": summary,
+        "wrapup_source": wrapup_source or "stored_mail",
+        "item_refs": item_refs or [],
+        "decisions": decisions or [],
+        "unresolved": unresolved or [],
+        "updated_at": now,
+    }
+    if not existing:
+        row["created_at"] = now
+    result = (
+        client.table("end_my_day_checkpoints")
+        .upsert(row, on_conflict="gmail_account_email,local_date")
+        .execute()
+    )
+    if not result.data:
+        raise RuntimeError("Failed to upsert end_my_day_checkpoints")
+    return result.data[0]

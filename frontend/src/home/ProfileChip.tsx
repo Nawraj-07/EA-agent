@@ -10,13 +10,19 @@ type Profile = {
 
 type CardPos = { top: number; right: number };
 
-export default function ProfileChip() {
+type ProfileChipProps = {
+  date?: string;
+  timezone?: string;
+};
+
+export default function ProfileChip({ date, timezone }: ProfileChipProps) {
   const [profile, setProfile] = useState<Profile | null>(null);
   const [imgFailed, setImgFailed] = useState(false);
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<CardPos>({ top: 0, right: 0 });
   const rootRef = useRef<HTMLDivElement>(null);
   const cardRef = useRef<HTMLDivElement>(null);
+  const showDate = Boolean(date && timezone);
 
   useEffect(() => {
     let cancelled = false;
@@ -119,6 +125,38 @@ export default function ProfileChip() {
             >
               <strong className="home-profile-name">{name}</strong>
               <span className="home-profile-email">{email}</span>
+              {showDate ? (
+                <div className="home-date-pill home-profile-date-pill">
+                  <svg
+                    className="home-date-icon"
+                    width="18"
+                    height="18"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    aria-hidden
+                  >
+                    <rect
+                      x="3"
+                      y="5"
+                      width="18"
+                      height="16"
+                      rx="2"
+                      stroke="currentColor"
+                      strokeWidth="1.75"
+                    />
+                    <path
+                      d="M3 10h18M8 3v4M16 3v4"
+                      stroke="currentColor"
+                      strokeWidth="1.75"
+                      strokeLinecap="round"
+                    />
+                  </svg>
+                  <div className="home-date-text">
+                    <strong>{date}</strong>
+                    <span>{timezone}</span>
+                  </div>
+                </div>
+              ) : null}
             </div>,
             document.body,
           )

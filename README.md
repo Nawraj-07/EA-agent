@@ -85,8 +85,11 @@ backfill walks older pages:
 - reconcile: compare the newest INBOX pages (`GMAIL_RECONCILE_PAGES`, default 10)
   to local rows and ingest any missing ids
 
-Gmail itself is never modified or deleted. Mail older than two days that is
-already read and beyond the newest ~1,000 INBOX messages waits for backfill.
+Gmail itself is never modified or deleted. Resumable backfill lists
+`in:inbox after:2026/05/31` (override with `GMAIL_INBOX_BACKFILL_AFTER`).
+The analysis queue only auto-summarizes mail from the last
+`GMAIL_AUTO_ANALYZE_NEWER_THAN_DAYS` days (default 2). Older stored mail is
+used as plaintext until you generate an AI summary.
 
 **Inbox ordering:** Conversations are grouped by Gmail thread and sorted by
 `internal_date` (Gmail metadata), not Supabase `created_at`. Default tab is

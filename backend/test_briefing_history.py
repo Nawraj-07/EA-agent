@@ -6,6 +6,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from briefing_service import (
+    _resolve_briefing_account,
     build_briefing_history,
     date_iso_to_internal_ms_range,
     history_date_range,
@@ -13,6 +14,7 @@ from briefing_service import (
     parse_target_briefing_date,
     run_daily_briefing,
 )
+from gmail_safety import get_allowed_gmail_account
 
 
 TZ = ZoneInfo("Asia/Kolkata")
@@ -171,6 +173,10 @@ def test_run_daily_briefing_saves_requested_briefing_date():
             return_value=[],
         ),
         patch(
+            "main.load_gmail_credentials",
+            side_effect=RuntimeError("skip ingest"),
+        ),
+        patch(
             "briefing_service.generate_briefing_content",
             return_value=FakeContent(),
         ),
@@ -187,6 +193,54 @@ def test_run_daily_briefing_saves_requested_briefing_date():
     assert captured["gmail_account_email"] == "me@example.com"
 
 
+def test_resolve_briefing_account_falls_back_when_gmail_refresh_fails():
+    with patch(
+        "main.load_gmail_credentials",
+        side_effect=RuntimeError("RefreshError"),
+    ):
+        assert _resolve_briefing_account() == get_allowed_gmail_account()
+
+
+def test_run_daily_briefing_saves_from_store_when_gmail_refresh_fails():
+    captured = {}
+
+    class FakeContent:
+        headline = "From store"
+        highlights = ["One"]
+        deadlines = []
+        action_items = []
+        notes = ""
+
+    with (
+        patch(
+            "briefing_service.parse_target_briefing_date",
+            return_value=date(2026, 11, 2),
+        ),
+        patch(
+            "main.load_gmail_credentials",
+            side_effect=RuntimeError("RefreshError"),
+        ),
+        patch(
+            "briefing_service.list_emails_for_briefing_day",
+            return_value=[{"subject": "Stored"}],
+        ),
+        patch(
+            "briefing_service.generate_briefing_content",
+            return_value=FakeContent(),
+        ),
+        patch(
+            "briefing_service.save_briefing",
+            side_effect=lambda **kwargs: captured.update(kwargs) or {"id": "saved-2"},
+        ),
+    ):
+        stats = run_daily_briefing(target_date="2026-11-02")
+
+    assert stats["status"] == "saved"
+    assert stats["saved"] is True
+    assert captured["gmail_account_email"] == get_allowed_gmail_account()
+    assert captured["briefing_date"] == "2026-11-02"
+
+
 if __name__ == "__main__":
     test_history_date_range_is_eight_days_oldest_to_newest()
     test_missing_dates_return_empty_slots()
@@ -197,4 +251,6 @@ if __name__ == "__main__":
     test_build_history_does_not_require_openai()
     test_briefing_date_column_overrides_created_at()
     test_run_daily_briefing_saves_requested_briefing_date()
+    test_resolve_briefing_account_falls_back_when_gmail_refresh_fails()
+    test_run_daily_briefing_saves_from_store_when_gmail_refresh_fails()
     print("All briefing history tests passed.")
