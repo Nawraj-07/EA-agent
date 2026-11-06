@@ -237,6 +237,34 @@ def test_reconcile_ingests_only_missing_ids():
     assert ingested == ["miss-1"]
 
 
+def test_ingest_skips_ids_already_stored():
+    stats = {"checked": 0, "saved": 0, "failed": 0, "skipped": 0}
+    fetched: list[str] = []
+
+    def fetch(_creds, mid):
+        fetched.append(mid)
+        return {"id": mid, "in_inbox": True}
+
+    with (
+        patch("scheduler.existing_gmail_message_ids", return_value={"old-1"}),
+        patch("scheduler.fetch_message_for_ingest", side_effect=fetch),
+        patch("scheduler.upsert_email_record"),
+    ):
+        scheduler._ingest_message_ids(
+            object(),
+            "me@example.com",
+            ["old-1", "new-1"],
+            stats,
+            skip_existing=True,
+        )
+
+    assert fetched == ["new-1"]
+    assert stats["skipped"] == 1
+    assert stats["saved"] == 1
+    assert stats["checked"] == 2
+    assert stats["failed"] == 0
+
+
 def test_ingest_retries_then_succeeds():
     stats = {"checked": 0, "saved": 0, "failed": 0}
     fetches = {"n": 0}
@@ -412,6 +440,7 @@ if __name__ == "__main__":
     test_scheduler_history_archives_removed_inbox()
     test_history_during_backfill_does_not_clear_page_token()
     test_reconcile_ingests_only_missing_ids()
+    test_ingest_skips_ids_already_stored()
     test_ingest_retries_then_succeeds()
     test_sync_runs_unread_catchup_and_reconcile()
     test_analyze_pending_can_filter_pending_only()

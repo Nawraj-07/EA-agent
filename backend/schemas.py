@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class EmailAnalysis(BaseModel):
@@ -51,12 +51,24 @@ class ChatSource(BaseModel):
     subject: str | None = None
     sender: str | None = None
     gmail_thread_id: str | None = None
+    gmail_message_id: str | None = None
+    importance: str | None = None
+    reason: str | None = None
+    received_at: str | None = None
 
 
 class ChatHistoryTurn(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(..., min_length=1, max_length=4000)
     sources: list[ChatSource] | None = None
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def _keep_history_short(cls, value: object) -> str:
+        text = str(value or "").strip()
+        if len(text) <= 4000:
+            return text
+        return text[:3997].rstrip() + "..."
 
 
 class ChatRequest(BaseModel):
@@ -117,6 +129,7 @@ class ChatResponse(BaseModel):
     answer: str
     sources: list[ChatSource] = Field(default_factory=list)
     draft: ChatDraft | None = None
+    freshness_note: str | None = None
     candidates: list[PersonCandidate] = Field(default_factory=list)
     candidate_total: int = 0
     candidate_offset: int = 0
@@ -147,6 +160,22 @@ class InboxQueryPlan(BaseModel):
         default=False,
         description="True when the question asks about unread mail",
     )
+    mailbox: Literal["inbox", "sent", "all"] = Field(
+        default="inbox",
+        description="inbox, sent, or all stored mail. Leave inbox unless the user was explicit.",
+    )
+    result_limit: int | None = Field(
+        default=None,
+        description="Requested list size such as top 5. Null when the user did not ask for a count of rows.",
+    )
+    rank_by: Literal["importance", "recency"] | None = Field(
+        default=None,
+        description="importance ranks by saved analysis. recency keeps newest first. Null for ordinary search.",
+    )
+    reply_need: Literal["confirmed", "outgoing"] | None = None
+    deadline_only: bool = False
+    newsletter_only: bool = False
+    response_language: Literal["en", "hi", "hinglish"] = "en"
     question_kind: Literal[
         "focused",
         "count",

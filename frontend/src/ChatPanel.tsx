@@ -111,6 +111,10 @@ type ChatSource = {
   subject?: string | null;
   sender?: string | null;
   gmail_thread_id?: string | null;
+  gmail_message_id?: string | null;
+  importance?: string | null;
+  reason?: string | null;
+  received_at?: string | null;
 };
 
 type ChatDraft = {
@@ -150,6 +154,7 @@ type ChatTurn = {
   role: "user" | "assistant";
   content: string;
   sources?: ChatSource[];
+  freshness?: string | null;
   draft?: ChatDraft | null;
   candidates?: PersonCandidate[];
   person?: PersonCard | null;
@@ -258,7 +263,8 @@ export default function ChatPanel({
       .slice(-(MAX_HISTORY_PAIRS * 2))
       .map((t) => ({
         role: t.role,
-        content: t.content,
+        content:
+          t.content.length > 3500 ? `${t.content.slice(0, 3497)}...` : t.content,
         ...(t.role === "assistant" && t.sources?.length
           ? { sources: t.sources }
           : {}),
@@ -296,23 +302,36 @@ export default function ChatPanel({
         | {
             answer?: string;
             sources?: ChatSource[];
+            freshness_note?: string | null;
             draft?: ChatDraft | null;
             candidates?: PersonCandidate[];
             candidate_offset?: number;
             candidate_has_more?: boolean;
             person?: PersonCard | null;
-            detail?: string;
+            detail?: string | { msg?: string }[];
           }
         | null;
 
       if (!response.ok) {
-        const detail =
-          data && typeof data.detail === "string" ? data.detail : null;
-        throw new Error(detail || `Chat request failed (${response.status})`);
+        const detail = data?.detail;
+        const detailText = Array.isArray(detail)
+          ? detail
+              .map((item) =>
+                item && typeof item === "object" && "msg" in item
+                  ? String((item as { msg?: string }).msg || "")
+                  : ""
+              )
+              .filter(Boolean)
+              .join(" ")
+          : typeof detail === "string"
+            ? detail
+            : "";
+        throw new Error(detailText || `Chat request failed (${response.status})`);
       }
 
       const answer = data?.answer || "No answer returned.";
       const sources = Array.isArray(data?.sources) ? data.sources : [];
+      const freshness = data?.freshness_note || "";
       const draft =
         data?.draft &&
         typeof data.draft === "object" &&
@@ -336,6 +355,7 @@ export default function ChatPanel({
         role: "assistant",
         content: answer,
         sources,
+        freshness,
         draft,
         candidates,
         person,
@@ -678,6 +698,9 @@ export default function ChatPanel({
                       </button>
                     </div>
                   ) : null}
+                  {turn.role === "assistant" && turn.freshness ? (
+                    <p className="chat-freshness">{turn.freshness}</p>
+                  ) : null}
                   {turn.role === "assistant" &&
                     turn.sources &&
                     turn.sources.length > 0 && (
@@ -691,10 +714,26 @@ export default function ChatPanel({
                             onClick={() => onOpenEmail?.(src.email_id)}
                             title={src.sender || undefined}
                           >
-                            {(turn.sources?.length ?? 0) > 1
-                              ? `${index + 1}. `
-                              : ""}
-                            {src.subject || "Untitled email"}
+                            {src.importance ? (
+                              <span className={`chat-mail-priority chat-mail-priority-${src.importance}`}>
+                                {src.importance}
+                              </span>
+                            ) : null}
+                            <span className="chat-mail-subject">
+                              {(turn.sources?.length ?? 0) > 1
+                                ? `${index + 1}. `
+                                : ""}
+                              {src.subject || "Untitled email"}
+                            </span>
+                            {src.sender ? (
+                              <span className="chat-mail-meta">{src.sender}</span>
+                            ) : null}
+                            {src.received_at ? (
+                              <span className="chat-mail-meta">{src.received_at}</span>
+                            ) : null}
+                            {src.reason ? (
+                              <span className="chat-mail-reason">{src.reason}</span>
+                            ) : null}
                           </button>
                         ))}
                       </div>

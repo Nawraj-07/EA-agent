@@ -302,6 +302,37 @@ def test_waiting_duration_positive():
     assert 29 <= hours <= 31
 
 
+def test_reply_body_is_loaded_only_when_snippet_is_not_enough():
+    from briefing_followup import _rows_needing_reply_body
+
+    newsletter = {
+        "id": "n1",
+        "subject": "Weekly digest",
+        "snippet": "Top stories",
+        "email_analyses": [{"summary": "Newsletter", "importance": "low", "action_required": False}],
+    }
+    already_clear = {
+        "id": "c1",
+        "subject": "Please confirm",
+        "snippet": "Could you confirm the numbers?",
+        "email_analyses": [{"summary": "Needs a reply", "importance": "high", "action_required": True}],
+    }
+    buried = {
+        "id": "b1",
+        "subject": "Update",
+        "snippet": "See the note below.",
+        "email_analyses": [{"summary": "Status update", "importance": "high", "action_required": True}],
+    }
+    high_without_action = {
+        "id": "h1",
+        "subject": "FYI",
+        "snippet": "Sharing the report.",
+        "email_analyses": [{"summary": "Report shared", "importance": "high", "action_required": False}],
+    }
+    needed = _rows_needing_reply_body([newsletter, already_clear, buried, high_without_action])
+    assert [row["id"] for row in needed] == ["b1"]
+
+
 def test_sync_refresh_noop_when_disabled():
     from ai_followup_assistant import refresh_followups_after_sync
 
@@ -372,6 +403,7 @@ if __name__ == "__main__":
     test_stable_key_account_isolation()
     test_recommendation_actions_gate()
     test_waiting_duration_positive()
+    test_reply_body_is_loaded_only_when_snippet_is_not_enough()
     test_sync_refresh_noop_when_disabled()
     test_duplicate_prevention_same_key()
     print("All AI follow-up assistant tests passed.")

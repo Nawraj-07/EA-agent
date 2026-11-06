@@ -31,7 +31,7 @@ CONSUMER_DOMAINS = {
     "icloud.com",
 }
 PRONOUN_FOLLOWUP_RE = re.compile(
-    r"\b(he|she|him|her|his|hers|they|them|their)\b",
+    r"\b(he|she|him|her|his|hers|they|them|their|that person|this person)\b",
     re.I,
 )
 _NAME = r"([A-Za-z][\w.'-]{1,}(?:\s+[A-Za-z][\w.'-]{1,})?)"

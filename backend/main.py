@@ -162,6 +162,24 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def _meter_browser_response(request: Request, call_next):
+    """Count bytes sent to the browser. Separate from Supabase egress."""
+    response = await call_next(request)
+    size = 0
+    body = getattr(response, "body", None)
+    if isinstance(body, (bytes, bytearray)):
+        size = len(body)
+    else:
+        header = response.headers.get("content-length")
+        if header and str(header).isdigit():
+            size = int(header)
+    from egress_meter import record_http
+
+    record_http(request.url.path, size)
+    return response
+
+
 # ========== SECTION 4: GOOGLE OAUTH CONFIGURATION ==========
 def create_google_flow() -> Flow:
     flow = Flow.from_client_config(
@@ -640,6 +658,24 @@ def _parse_optional_iso_date(value: str | None, *, field: str) -> str | None:
     return text[:10]
 
 
+@app.get("/db/inbox/revision")
+def inbox_revision():
+    """Tiny sync stamp so the inbox can skip a full list reload."""
+    from db import get_sync_state
+
+    account = get_allowed_gmail_account()
+    state = None
+    try:
+        state = get_sync_state(account)
+    except Exception:
+        logger.warning("Could not load inbox revision")
+    state = state or {}
+    return {
+        "updated_at": state.get("updated_at"),
+        "backfill_status": state.get("backfill_status"),
+    }
+
+
 @app.get("/db/conversations")
 def get_conversations(
     category: str = "inbox",
@@ -855,6 +891,16 @@ def chat_with_emails(payload: ChatRequest):
     account = _connected_gmail_account()
 
     try:
+        sync_state = None
+        if account:
+            try:
+                from db import get_sync_state
+
+                sync_state = get_sync_state(account)
+            except Exception:
+                logger.exception("Chat sync state lookup failed")
+                sync_state = None
+
         if payload.email_id:
             try:
                 UUID(payload.email_id)
@@ -882,6 +928,7 @@ def chat_with_emails(payload: ChatRequest):
                 selected_contact_id=payload.selected_contact_id,
                 bound_contact_id=payload.bound_contact_id,
                 candidate_offset=payload.candidate_offset,
+                sync_state=sync_state,
             )
         else:
             retrieval = retrieve_emails_for_question(
@@ -896,6 +943,7 @@ def chat_with_emails(payload: ChatRequest):
                 selected_contact_id=payload.selected_contact_id,
                 bound_contact_id=payload.bound_contact_id,
                 candidate_offset=payload.candidate_offset,
+                sync_state=sync_state,
             )
             if retrieval.question_kind != "general" and not account:
                 raise HTTPException(
@@ -1278,6 +1326,17 @@ def approve_and_send_draft(draft_id: UUID):
 
 
 # ========== SECTION 19: MANUAL GMAIL SYNC (TASK 6.1) ==========
+@app.get("/internal/egress-stats")
+def egress_stats():
+    """Development counters. No email bodies, tokens, or credentials."""
+    from egress_meter import enabled as meter_enabled
+    from egress_meter import snapshot
+
+    if not meter_enabled():
+        raise HTTPException(status_code=404, detail="Egress meter is off.")
+    return snapshot()
+
+
 @app.post("/internal/sync-now")
 def trigger_gmail_sync_now():
     """

@@ -1,26 +1,109 @@
+import logging
 import os
 import re
+import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 from supabase import create_client
 
+from egress_meter import enabled as egress_meter_enabled
+from egress_meter import payload_bytes, record_supabase, using_operation
+
+
+logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
 
 load_dotenv(BASE_DIR / ".env")
 load_dotenv(BASE_DIR.parent / ".env", override=False)
 
+# List and ranking reads. Full body stays on the detail, thread, draft, and
+# analysis paths.
+EMAIL_LIST_COLUMNS = (
+    "id,gmail_account_email,gmail_message_id,gmail_thread_id,"
+    "subject,sender,snippet,received_at,internal_date,label_ids,"
+    "in_inbox,analysis_status"
+)
+ANALYSIS_LIST_COLUMNS = (
+    "summary,category,importance,deadlines,action_required,confidence"
+)
+EMAIL_LIST_WITH_ANALYSIS = (
+    f"{EMAIL_LIST_COLUMNS},email_analyses({ANALYSIS_LIST_COLUMNS})"
+)
+EMAIL_DETAIL_WITH_ANALYSIS = (
+    f"{EMAIL_LIST_COLUMNS},body,email_analyses({ANALYSIS_LIST_COLUMNS})"
+)
+EMAIL_SYNC_LOOKUP_COLUMNS = "id,analysis_status,label_ids,gmail_message_id"
+
+_supabase_client = None
+_CONV_CACHE: dict[tuple, tuple[float, dict]] = {}
+_CONV_CACHE_TTL_SECONDS = 15.0
+
+
+class _MeteredQuery:
+    """Count Supabase response bytes without keeping the payload."""
+
+    def __init__(self, inner, table: str):
+        self._inner = inner
+        self._table = table
+
+    def execute(self, *args, **kwargs):
+        result = self._inner.execute(*args, **kwargs)
+        data = getattr(result, "data", None)
+        if isinstance(data, list):
+            rows = len(data)
+        elif data:
+            rows = 1
+        else:
+            rows = 0
+        record_supabase(self._table, rows, payload_bytes(data))
+        return result
+
+    def __getattr__(self, name):
+        attr = getattr(self._inner, name)
+        if not callable(attr):
+            return attr
+
+        def wrapped(*args, **kwargs):
+            out = attr(*args, **kwargs)
+            if out is self._inner:
+                return self
+            if hasattr(out, "execute"):
+                return _MeteredQuery(out, self._table)
+            return out
+
+        return wrapped
+
+
+class _MeteredClient:
+    def __init__(self, inner):
+        self._inner = inner
+
+    def table(self, name: str):
+        return _MeteredQuery(self._inner.table(name), name)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
 
 def get_supabase_client():
+    global _supabase_client
+    if _supabase_client is not None:
+        return _supabase_client
+
     url = os.getenv("SUPABASE_URL")
     service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
     if not url or not service_role_key:
         raise RuntimeError("Supabase credentials are missing")
 
-    return create_client(url, service_role_key)
+    client = create_client(url, service_role_key)
+    if egress_meter_enabled():
+        client = _MeteredClient(client)
+    _supabase_client = client
+    return _supabase_client
 
 
 def _utcnow() -> str:
@@ -87,7 +170,7 @@ def get_email_by_gmail_id(
     client = get_supabase_client()
     response = (
         client.table("emails")
-        .select("*")
+        .select(EMAIL_SYNC_LOOKUP_COLUMNS)
         .eq("gmail_account_email", gmail_account_email)
         .eq("gmail_message_id", gmail_message_id)
         .limit(1)
@@ -147,6 +230,7 @@ def upsert_email_record(email: dict, *, gmail_account_email: str) -> dict:
             email_data,
             on_conflict="gmail_account_email,gmail_message_id",
         )
+        .select("id,analysis_status,gmail_message_id")
         .execute()
     )
 
@@ -250,7 +334,7 @@ def list_pending_analysis_emails(
     )
     query = (
         client.table("emails")
-        .select("*")
+        .select(EMAIL_DETAIL_WITH_ANALYSIS)
         .eq("gmail_account_email", gmail_account_email)
         .in_("analysis_status", allowed)
     )
@@ -285,11 +369,13 @@ def list_stored_emails(
     gmail_account_email: str | None = None,
     in_inbox_only: bool = True,
     cursor_internal_date: int | None = None,
+    include_body: bool = False,
 ):
     """List messages ordered by Gmail internal_date (not created_at)."""
     client = get_supabase_client()
+    columns = EMAIL_DETAIL_WITH_ANALYSIS if include_body else EMAIL_LIST_WITH_ANALYSIS
 
-    query = client.table("emails").select("*, email_analyses(*)")
+    query = client.table("emails").select(columns)
 
     if gmail_account_email:
         query = query.eq("gmail_account_email", gmail_account_email)
@@ -311,13 +397,49 @@ def get_stored_email(email_id: str):
 
     response = (
         client.table("emails")
-        .select("*, email_analyses(*)")
+        .select(EMAIL_DETAIL_WITH_ANALYSIS)
         .eq("id", email_id)
         .maybe_single()
         .execute()
     )
 
     return response.data
+
+
+def hydrate_email_bodies(emails: list[dict]) -> list[dict]:
+    """Load stored bodies for rows that do not already have one."""
+    missing = [
+        str(email.get("id"))
+        for email in emails
+        if email.get("id") and "body" not in email
+    ]
+    missing = [
+        eid
+        for eid in missing
+        if re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            eid,
+        )
+    ]
+    if not missing:
+        return emails
+    client = get_supabase_client()
+    found: dict[str, str] = {}
+    for start in range(0, len(missing), 50):
+        chunk = missing[start : start + 50]
+        response = (
+            client.table("emails")
+            .select("id,body")
+            .in_("id", chunk)
+            .execute()
+        )
+        for row in response.data or []:
+            found[str(row.get("id"))] = row.get("body") or ""
+    for email in emails:
+        eid = str(email.get("id") or "")
+        if eid in found:
+            email["body"] = found[eid]
+    return emails
 
 
 _ILIKE_SAFE = re.compile(r"[^a-zA-Z0-9_-]+")
@@ -415,11 +537,14 @@ def _apply_chat_row_filters(
     importance: str | None = None,
     action_required: bool | None = None,
     unread_only: bool = False,
+    label_contains: str | None = None,
 ):
     if gmail_account_email:
         query = query.eq("gmail_account_email", gmail_account_email)
     if in_inbox_only:
         query = query.eq("in_inbox", True)
+    if label_contains and str(label_contains).strip():
+        query = query.contains("label_ids", [str(label_contains).strip()])
     if unread_only:
         query = query.contains("label_ids", ["UNREAD"])
     if sender_contains and sender_contains.strip():
@@ -456,20 +581,51 @@ def search_emails_for_chat(
     limit: int = 15,
     in_inbox_only: bool = True,
     unread_only: bool = False,
+    label_contains: str | None = None,
 ) -> list:
     """
     Filtered email retrieval for Ask My Inbox (PostgREST filters + in-memory refine).
     """
+    with using_operation("chat_search"):
+        return _search_emails_for_chat(
+            gmail_account_email=gmail_account_email,
+            sender_contains=sender_contains,
+            keywords=keywords,
+            importance=importance,
+            action_required=action_required,
+            internal_date_from_ms=internal_date_from_ms,
+            internal_date_to_ms=internal_date_to_ms,
+            limit=limit,
+            in_inbox_only=in_inbox_only,
+            unread_only=unread_only,
+            label_contains=label_contains,
+        )
+
+
+def _search_emails_for_chat(
+    *,
+    gmail_account_email: str | None,
+    sender_contains: str | None = None,
+    keywords: list[str] | None = None,
+    importance: str | None = None,
+    action_required: bool | None = None,
+    internal_date_from_ms: int | None = None,
+    internal_date_to_ms: int | None = None,
+    limit: int = 15,
+    in_inbox_only: bool = True,
+    unread_only: bool = False,
+    label_contains: str | None = None,
+) -> list:
     client = get_supabase_client()
     tokens = tokenize_search_keywords(keywords)
     needs_analysis_filter = importance is not None or action_required is not None
-    # SQL already filters all eligible rows; fetch extra matches so in-memory
-    # refine can rank before the OpenAI context cap.
-    fetch_limit = min(max(limit * 8, 80), 500)
+    # The caller passes the pool size. SQL already applies keyword filters,
+    # so this read does not multiply the limit again.
+    fetch_limit = min(max(int(limit or 1), 1), 120)
     select = (
-        "id, email_analyses!inner(*)"
+        f"{EMAIL_LIST_COLUMNS},email_analyses!inner({ANALYSIS_LIST_COLUMNS})"
         if needs_analysis_filter
-        else "*, email_analyses(*)"
+        else EMAIL_LIST_WITH_ANALYSIS
     )
 
     query = client.table("emails").select(select)
@@ -484,6 +640,7 @@ def search_emails_for_chat(
         importance=importance,
         action_required=action_required,
         unread_only=unread_only,
+        label_contains=label_contains,
     )
 
     rows = (
@@ -501,7 +658,7 @@ def search_emails_for_chat(
             continue
         if action_required is not None and bool(analysis.get("action_required")) != action_required:
             continue
-        if not row_matches_all_tokens(row, tokens):
+        if "body" in row and not row_matches_all_tokens(row, tokens):
             continue
         filtered.append(row)
         if len(filtered) >= limit:
@@ -521,8 +678,9 @@ def count_emails_for_chat(
     internal_date_to_ms: int | None = None,
     in_inbox_only: bool = True,
     unread_only: bool = False,
+    label_contains: str | None = None,
 ) -> int:
-    """Postgres COUNT of stored Inbox rows matching the same chat filters."""
+    """Postgres COUNT of stored rows matching the same chat filters."""
     client = get_supabase_client()
     tokens = tokenize_search_keywords(keywords)
     needs_analysis_filter = importance is not None or action_required is not None
@@ -539,6 +697,7 @@ def count_emails_for_chat(
         importance=importance,
         action_required=action_required,
         unread_only=unread_only,
+        label_contains=label_contains,
     )
     response = query.limit(0).execute()
     counted = getattr(response, "count", None)
@@ -566,6 +725,29 @@ def list_conversations(
     date_from_iso: str | None = None,
     date_to_iso: str | None = None,
 ) -> dict:
+    """Conversation list. See _list_conversations_impl."""
+    with using_operation("inbox_list"):
+        return _list_conversations_impl(
+            gmail_account_email=gmail_account_email,
+            category=category,
+            limit=limit,
+            cursor_internal_date=cursor_internal_date,
+            cursor_thread_id=cursor_thread_id,
+            date_from_iso=date_from_iso,
+            date_to_iso=date_to_iso,
+        )
+
+
+def _list_conversations_impl(
+    *,
+    gmail_account_email: str,
+    category: str = "inbox",
+    limit: int = 20,
+    cursor_internal_date: int | None = None,
+    cursor_thread_id: str | None = None,
+    date_from_iso: str | None = None,
+    date_to_iso: str | None = None,
+) -> dict:
     """
     Conversation list matching Gmail-style newest-first threads.
 
@@ -577,9 +759,29 @@ def list_conversations(
     from briefing_service import date_iso_to_internal_ms_range
     from gmail_sync import message_matches_category
 
+    cache_key = (
+        gmail_account_email,
+        category,
+        limit,
+        cursor_internal_date,
+        cursor_thread_id,
+        date_from_iso,
+        date_to_iso,
+    )
+    cached = _CONV_CACHE.get(cache_key)
+    now = time.monotonic()
+    if cached and now - cached[0] < _CONV_CACHE_TTL_SECONDS:
+        stored = cached[1]
+        cursor = stored.get("next_cursor")
+        return {
+            "conversations": [dict(item) for item in stored.get("conversations") or []],
+            "next_cursor": dict(cursor) if isinstance(cursor, dict) else None,
+            "category": stored.get("category"),
+        }
+
     client = get_supabase_client()
-    scan_batch = 200
-    max_scan_rows = 4000
+    scan_batch = max(limit * 2, 40)
+    max_scan_rows = 800
     start_ms, end_ms = date_iso_to_internal_ms_range(date_from_iso, date_to_iso)
 
     conversations: list[dict] = []
@@ -591,7 +793,7 @@ def list_conversations(
     while len(conversations) < limit and scanned < max_scan_rows:
         query = (
             client.table("emails")
-            .select("*, email_analyses(*)")
+            .select(EMAIL_LIST_WITH_ANALYSIS)
             .eq("gmail_account_email", gmail_account_email)
             .eq("in_inbox", True)
         )
@@ -658,21 +860,26 @@ def list_conversations(
         if len(rows) < scan_batch:
             break
 
-    # Fill message_count for returned threads (best-effort).
-    for conv in conversations:
-        tid = conv["thread_id"]
+    thread_ids = [conv["thread_id"] for conv in conversations if conv.get("thread_id")]
+    tallies: dict[str, int] = {}
+    if thread_ids:
         try:
             count_resp = (
                 client.table("emails")
-                .select("id")
+                .select("gmail_thread_id")
                 .eq("gmail_account_email", gmail_account_email)
-                .eq("gmail_thread_id", tid)
                 .eq("in_inbox", True)
+                .in_("gmail_thread_id", thread_ids)
                 .execute()
             )
-            conv["message_count"] = len(count_resp.data or [])
+            for row in count_resp.data or []:
+                tid = row.get("gmail_thread_id")
+                if tid:
+                    tallies[tid] = tallies.get(tid, 0) + 1
         except Exception:
-            conv["message_count"] = 1
+            logger.exception("Conversation message counts failed")
+    for conv in conversations:
+        conv["message_count"] = tallies.get(conv["thread_id"], 1)
 
     next_cursor = None
     if len(conversations) >= limit:
@@ -682,28 +889,62 @@ def list_conversations(
             "thread_id": last["thread_id"],
         }
 
-    return {
+    result = {
         "conversations": conversations,
         "next_cursor": next_cursor,
         "category": category,
     }
+    _CONV_CACHE[cache_key] = (now, result)
+    if len(_CONV_CACHE) > 32:
+        oldest = min(_CONV_CACHE, key=lambda key: _CONV_CACHE[key][0])
+        _CONV_CACHE.pop(oldest, None)
+    return result
 
 
 def list_thread_messages(
     *,
     gmail_account_email: str,
     thread_id: str,
+    include_body: bool = True,
 ) -> list:
     client = get_supabase_client()
+    columns = EMAIL_DETAIL_WITH_ANALYSIS if include_body else EMAIL_LIST_WITH_ANALYSIS
     response = (
         client.table("emails")
-        .select("*, email_analyses(*)")
+        .select(columns)
         .eq("gmail_account_email", gmail_account_email)
         .eq("gmail_thread_id", thread_id)
         .order("internal_date", desc=False)
         .execute()
     )
     return response.data or []
+
+
+def list_followup_threads(
+    *,
+    gmail_account_email: str,
+    thread_ids: list[str],
+) -> dict[str, list]:
+    """Metadata for many threads in one read. Bodies stay out of this scan."""
+    grouped: dict[str, list] = {}
+    ids = [tid for tid in thread_ids if tid and not str(tid).startswith("msg:")]
+    if not ids or not gmail_account_email:
+        return grouped
+    client = get_supabase_client()
+    for start in range(0, len(ids), 50):
+        chunk = ids[start : start + 50]
+        response = (
+            client.table("emails")
+            .select(EMAIL_LIST_WITH_ANALYSIS)
+            .eq("gmail_account_email", gmail_account_email)
+            .in_("gmail_thread_id", chunk)
+            .execute()
+        )
+        for row in response.data or []:
+            tid = str(row.get("gmail_thread_id") or "")
+            if tid:
+                grouped.setdefault(tid, []).append(row)
+    return grouped
 
 
 def get_sync_state(gmail_account_email: str) -> dict | None:
@@ -781,7 +1022,7 @@ def _count_account_rows(table: str, gmail_account_email: str) -> int:
     client = get_supabase_client()
     result = (
         client.table(table)
-        .select("*", count="exact")
+        .select("id", count="exact")
         .eq("gmail_account_email", gmail_account_email)
         .limit(1)
         .execute()
@@ -1021,13 +1262,19 @@ def mark_draft_sent(draft_id: str, gmail_sent_message_id: str | None = None):
     return response.data[0] if response.data else None
 
 
-def list_emails_for_briefing(since_iso: str, limit: int = 30) -> list:
+def list_emails_for_briefing(
+    since_iso: str,
+    limit: int = 30,
+    *,
+    include_body: bool = False,
+) -> list:
     """Recent stored emails (with analyses) for the daily briefing window."""
     client = get_supabase_client()
+    columns = EMAIL_DETAIL_WITH_ANALYSIS if include_body else EMAIL_LIST_WITH_ANALYSIS
 
     response = (
         client.table("emails")
-        .select("*, email_analyses(*)")
+        .select(columns)
         .gte("created_at", since_iso)
         .order("created_at", desc=True)
         .limit(limit)
@@ -1043,15 +1290,17 @@ def list_emails_for_briefing_day(
     start_ms: int,
     end_ms: int,
     limit: int = 30,
+    include_body: bool = False,
 ) -> list:
     """Emails whose Gmail internal_date falls in [start_ms, end_ms)."""
     if not gmail_account_email:
         return []
 
     client = get_supabase_client()
+    columns = EMAIL_DETAIL_WITH_ANALYSIS if include_body else EMAIL_LIST_WITH_ANALYSIS
     response = (
         client.table("emails")
-        .select("*, email_analyses(*)")
+        .select(columns)
         .eq("gmail_account_email", gmail_account_email)
         .gte("internal_date", start_ms)
         .lt("internal_date", end_ms)
@@ -1289,14 +1538,16 @@ def list_emails_for_briefing_range(
     start_ms: int,
     end_ms: int,
     limit: int = 120,
+    include_body: bool = False,
 ) -> list:
     """Emails whose Gmail internal_date falls in [start_ms, end_ms)."""
     if not gmail_account_email:
         return []
     client = get_supabase_client()
+    columns = EMAIL_DETAIL_WITH_ANALYSIS if include_body else EMAIL_LIST_WITH_ANALYSIS
     response = (
         client.table("emails")
-        .select("*, email_analyses(*)")
+        .select(columns)
         .eq("gmail_account_email", gmail_account_email)
         .gte("internal_date", start_ms)
         .lt("internal_date", end_ms)

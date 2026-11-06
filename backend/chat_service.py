@@ -7,6 +7,7 @@ import calendar
 import logging
 import os
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -71,7 +72,9 @@ SUMMARY_KIND_RE = re.compile(
 )
 MAILBOX_INTENT_RE = re.compile(
     r"\b(e-?mails?|mails?|messages?|inbox|unread|drafts?|senders?|"
-    r"deadlines?)\b|action required",
+    r"deadlines?|replies|reply|follow-?ups?|newsletters?|attachments?|"
+    r"urgent|important)\b|action required|"
+    r"[\u0900-\u097F]",
     re.I,
 )
 MAILBOX_TIME_RE = re.compile(
@@ -180,6 +183,22 @@ SENDER_STOP = {
     "year",
     "yesterday",
     "today",
+    "ones",
+    "one",
+    "those",
+    "these",
+    "received",
+    "i",
+    "we",
+    "that",
+    "which",
+    "what",
+    "top",
+    "list",
+    "aaj",
+    "kal",
+    "parso",
+    "parson",
 }
 
 COUNT_KEYWORD_DROP = set(MONTH_LOOKUP) | {
@@ -276,7 +295,8 @@ SHOW_BRIEFING_RE = re.compile(
     re.I,
 )
 THIS_EMAIL_RE = re.compile(
-    r"\b(this (?:e-?mail|message|mail|one)|the selected (?:e-?mail|message|mail))\b",
+    r"\b(this (?:e-?mail|message|mail|one)|the selected (?:e-?mail|message|mail)"
+    r"|is email ka|yeh email|ye email)\b|इस ईमेल",
     re.I,
 )
 FOLLOWUP_RE = re.compile(
@@ -310,6 +330,14 @@ class ChatRetrieval:
     needs_clarification: str | None = None
     briefing: dict | None = None
     person: dict | None = None
+    rank_notes: dict = field(default_factory=dict)
+    freshness_note: str | None = None
+    empty_reason: str | None = None
+    response_language: str = "en"
+    direct_list: bool = False
+    mailbox: str = "inbox"
+    requested_limit: int | None = None
+    prepared_answer: str | None = None
 
 
 def _chat_limit() -> int:
@@ -389,21 +417,28 @@ Body Preview: {(email.get("body") or email.get("snippet") or "")[:1500]}
     return "\n---\n".join(parts)
 
 
-def emails_to_sources(emails: list[dict]) -> list[dict]:
+def emails_to_sources(emails: list[dict], notes: dict | None = None) -> list[dict]:
     sources: list[dict] = []
     seen: set[str] = set()
+    details = notes or {}
     for email in emails:
         eid = email.get("id")
         if not eid or eid in seen:
             continue
         seen.add(eid)
+        note = details.get(str(eid)) or {}
+        gmail_id = email.get("gmail_message_id") or note.get("gmail_message_id")
         sources.append(
             ChatSource(
                 email_id=str(eid),
                 subject=email.get("subject"),
                 sender=email.get("sender"),
                 gmail_thread_id=email.get("gmail_thread_id"),
-            ).model_dump()
+                gmail_message_id=str(gmail_id) if gmail_id else None,
+                importance=note.get("importance"),
+                reason=note.get("reason"),
+                received_at=note.get("received_at"),
+            ).model_dump(exclude_none=True)
         )
     return sources
 
@@ -517,8 +552,26 @@ LIST_PICK_RE = re.compile(
 )
 
 
+def _ordinal_reference(question: str) -> int | None:
+    if parse_sender(question) or parse_date_windows(question):
+        return None
+    if re.search(r"\btop\s+\d+", question or "", re.I):
+        return None
+    match = _ORDINAL_REF_RE.search(question or "")
+    if not match:
+        return None
+    if match.group("num"):
+        return int(match.group("num"))
+    if match.group("nth"):
+        return int(match.group("nth"))
+    return _ORDINAL_INDEX.get((match.group("word") or "").lower())
+
+
 def list_pick_index(question: str) -> int | None:
     """1-based index when the question chooses an item from the previous list."""
+    ordinal = _ordinal_reference(question)
+    if ordinal:
+        return ordinal
     match = LIST_PICK_RE.match(question or "")
     if not match:
         return None
@@ -533,22 +586,34 @@ def list_pick_index(question: str) -> int | None:
     return _ORDINAL_INDEX.get((match.group("ordword") or "").lower())
 
 
-def previous_list_sources(history: list | None) -> list[dict]:
+def _sources_from_turn(turn) -> list[dict]:
+    raw = turn.sources if isinstance(turn, ChatHistoryTurn) else turn.get("sources")
+    sources: list[dict] = []
+    for item in raw or []:
+        if isinstance(item, ChatSource):
+            sources.append(item.model_dump())
+        elif isinstance(item, dict) and item.get("email_id"):
+            sources.append(item)
+    return sources
+
+
+def previous_list_sources(history: list | None, *, prefer_list: bool = False) -> list[dict]:
     if not history:
         return []
+    short: list[dict] = []
     for turn in reversed(history):
         role, _content = _turn_role_content(turn)
         if role != "assistant":
             continue
-        raw = turn.sources if isinstance(turn, ChatHistoryTurn) else turn.get("sources")
-        sources: list[dict] = []
-        for item in raw or []:
-            if isinstance(item, ChatSource):
-                sources.append(item.model_dump())
-            elif isinstance(item, dict) and item.get("email_id"):
-                sources.append(item)
+        sources = _sources_from_turn(turn)
+        if not sources:
+            continue
+        if prefer_list and len(sources) < 2:
+            if not short:
+                short = sources
+            continue
         return sources
-    return []
+    return short
 
 
 def has_mailbox_intent(question: str) -> bool:
@@ -693,6 +758,16 @@ def parse_sender_query(question: str) -> tuple[str | None, str | None]:
         if cleaned:
             return cleaned, None
 
+    hinglish_sender = re.search(
+        r"\b([A-Za-z][A-Za-z0-9._-]*)\s+(?:ka|ki|ke)\s+(?:koi\s+)?(?:e-?mail|mail|message)\b",
+        text,
+        re.I,
+    )
+    if hinglish_sender:
+        cleaned = _clean_sender_term(hinglish_sender.group(1))
+        if cleaned and cleaned.lower() not in {"aaj", "kal", "parso", "parson"}:
+            return cleaned, None
+
     from_match = SENDER_RE.search(text)
     if from_match:
         cleaned = _clean_sender_term(from_match.group(1))
@@ -751,13 +826,570 @@ def _this_month_window(today: date) -> DateWindow:
     return DateWindow(start, today, "this month")
 
 
+_DAY_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "teen": 3,
+    "तीन": 3,
+    "एक": 1,
+    "दो": 2,
+    "चार": 4,
+    "पांच": 5,
+    "पाँच": 5,
+    "छह": 6,
+    "सात": 7,
+    "आठ": 8,
+    "नौ": 9,
+    "दस": 10,
+    "do": 2,
+    "paanch": 5,
+    "panch": 5,
+}
+_LIST_REQUEST_RE = re.compile(
+    r"\b(list|show all|show me|find|which emails|which mails|top\s+\d+|batao|dikhao|dikha)\b",
+    re.I,
+)
+_RANK_RE = re.compile(
+    r"\b("
+    r"top\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)"
+    r"|most important|important (?:e-?mails?|mails?)"
+    r"|urgent attention|focus on|what should i focus"
+    r")\b",
+    re.I,
+)
+# Vowel signs are not word characters, so \b cannot wrap these words.
+_HI_RANK_RE = re.compile(r"महत्वपूर्ण|जरूरी|जरुरी|अत्यावश्यक")
+_LATEST_RE = re.compile(r"\b(latest|newest|most recent)\b", re.I)
+_CLIENT_RE = re.compile(r"\b(clients?|customers?)\b|ग्राहक|क्लाइंट", re.I)
+_CONVERSATION_RE = re.compile(
+    r"\b(conversations?|threads?|discussion|discuss)\b|बातचीत|बात",
+    re.I,
+)
+_CLIENT_NAME_RE = re.compile(
+    r"\b(?:with|from)\s+(?:my\s+|the\s+)?(?:client|customer)\s+"
+    r"([A-Za-z][\w.'-]{2,}(?:\s+[A-Za-z][\w.'-]{2,})?)",
+    re.I,
+)
+_NO_REPLY_SENDER_RE = re.compile(
+    r"no-?reply|noreply|notifications?@|mailer-daemon|donotreply",
+    re.I,
+)
+_CLIENT_SCAN_LIMIT = 80
+_PENDING_REPLY_RE = re.compile(
+    r"\b("
+    r"pending replies|pending reply|need(?:s|ed)? (?:my |a |your )?repl"
+    r"|require(?:s)? (?:my |a |your )?repl|awaiting (?:my |your )?reply"
+    r"|reply right now|emails? (?:that |which )?need a reply"
+    r"|reply dena|kin emails"
+    r")\b|किन ईमेल|जवाब देना",
+    re.I,
+)
+_OUTGOING_UNANSWERED_RE = re.compile(
+    r"\b(outgoing requests?|still unanswered|awaiting a response|unanswered requests?)\b",
+    re.I,
+)
+_SENT_MAIL_RE = re.compile(
+    r"\b(did i send|i sent|emails? i sent|mails? i sent|sent today|sent mail|which emails did i send)\b",
+    re.I,
+)
+_ALL_MAIL_RE = re.compile(r"\b(all mail|entire mailbox)\b", re.I)
+_NEWSLETTER_RE = re.compile(r"\bnewsletters?\b", re.I)
+_DEADLINE_RE = re.compile(r"\bdeadlines?\b", re.I)
+_ATTACHMENT_RE = re.compile(
+    r"\b(?:with|have|has|having)\s+(?:an\s+)?attachments?\b",
+    re.I,
+)
+_RECIPIENT_RE = re.compile(
+    r"\b(?:e-?mails?|mails?|messages?)\s+to\s+[A-Za-z]|sent to\s+[A-Za-z]|\brecipient\b",
+    re.I,
+)
+_TOP_LIMIT_RE = re.compile(
+    r"\btop\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b"
+    r"|\b(\d+)\s+(?:most\s+recent|latest|newest|important|e-?mails?|mails?|messages?)\b",
+    re.I,
+)
+_ORDINAL_REF_RE = re.compile(
+    r"\b(?:the\s+)?(?P<word>first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)"
+    r"\s+(?:one|e-?mail|mail|message)\b"
+    r"|\b(?P<nth>\d+)\s*(?:st|nd|rd|th)\s+(?:one|e-?mail|mail|message)\b"
+    r"|\b(?:e-?mail|mail|message|number|no\.?)\s*#?\s*(?P<num>\d+)\b",
+    re.I,
+)
+_PRIOR_EMAIL_RE = re.compile(
+    r"\b("
+    r"who sent (?:it|that|this)|who is it from|summarize it|summarise it|"
+    r"what about it|draft a reply|reply to (?:it|that|this)"
+    r")\b",
+    re.I,
+)
+_EXPLICIT_EN_RE = re.compile(r"\b(in english|english mein)\b", re.I)
+_EXPLICIT_HI_RE = re.compile(r"(हिंदी में|हिन्दी में|\bin hindi\b|hindi mein)", re.I)
+_DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
+_HINGLISH_RE = re.compile(
+    r"\b(aaj|kal|parso|batao|bata|mujhe|kya|kaun|dikhao|dikha|wala|wali|hai|tha|thi|hain)\b",
+    re.I,
+)
+_MISSED_RE = re.compile(r"\bwhat did i miss\b", re.I)
+
+
+def _past_mail_cue(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(aaya|aayi|aaye|mila|mili|tha|thi|the|received|receive|arrived)\b"
+            r"|आया|आई|मिला|मिली",
+            text or "",
+            re.I,
+        )
+    )
+
+
+def _fold_question(text: str) -> str:
+    """Drop Devanagari nukta so ज़रूरी and ज़रूरी both match जरूरी."""
+    folded = unicodedata.normalize("NFD", text or "").replace("\u093c", "")
+    return unicodedata.normalize("NFC", folded)
+
+
+def _asks_rank(question: str) -> bool:
+    text = _fold_question(question)
+    return bool(_RANK_RE.search(text) or _HI_RANK_RE.search(text))
+
+
+def _relative_day_span(text: str, today: date) -> DateWindow | None:
+    folded = _fold_question(text)
+    match = re.search(
+        r"(?:पिछले|पिछ्ले|pichhle|pichle|last|past|previous)\s+"
+        r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten|teen|"
+        r"एक|दो|तीन|चार|पांच|पाँच|छह|सात|आठ|नौ|दस)\s+"
+        r"(?:days|दिनों|दिन|dinon|dino|din)(?!\w)",
+        folded,
+        re.I,
+    )
+    if not match:
+        return None
+    raw = match.group(1).lower()
+    count = int(raw) if raw.isdigit() else _DAY_WORDS.get(raw)
+    if not count:
+        return None
+    count = max(1, min(count, 31))
+    start = today - timedelta(days=count - 1)
+    return DateWindow(start, today, f"last {count} days")
+
+
+def _limit_from_question(question: str) -> int | None:
+    match = _TOP_LIMIT_RE.search(question or "")
+    if not match:
+        return None
+    raw = (match.group(1) or match.group(2) or "").lower()
+    if not raw:
+        return None
+    number = int(raw) if raw.isdigit() else _DAY_WORDS.get(raw)
+    if not number:
+        return None
+    return max(1, min(number, 10))
+
+
+def detect_response_language(question: str) -> str:
+    """Language for the answer. Tool filters stay language-neutral."""
+    text = question or ""
+    if _EXPLICIT_EN_RE.search(text):
+        return "en"
+    if _EXPLICIT_HI_RE.search(text) or _DEVANAGARI_RE.search(text):
+        return "hi"
+    if _HINGLISH_RE.search(text):
+        return "hinglish"
+    return "en"
+
+
+def rejected_from_phrase(question: str) -> bool:
+    """True when 'from …' is a pronoun or filler, not a sender name."""
+    match = SENDER_RE.search(question or "")
+    if not match:
+        return False
+    return _clean_sender_term(match.group(1)) is None
+
+
+def _looks_like_list(question: str) -> bool:
+    return bool(_LIST_REQUEST_RE.search(question or "")) and not COUNT_KIND_RE.search(
+        question or ""
+    )
+
+
+def parse_mailbox(question: str) -> str | None:
+    text = question or ""
+    if _SENT_MAIL_RE.search(text) and not _OUTGOING_UNANSWERED_RE.search(text):
+        return "sent"
+    if _ALL_MAIL_RE.search(text):
+        return "all"
+    if re.search(r"\b(inbox|received|aaya|aayi|mila)\b|मिले|आया", text, re.I):
+        return "inbox"
+    return None
+
+
+def _asks_unsupported(question: str) -> str | None:
+    text = question or ""
+    if _ATTACHMENT_RE.search(text):
+        return (
+            "Attachment status is not stored on saved mail, "
+            "so I can't list messages that have files attached."
+        )
+    if _RECIPIENT_RE.search(text) and not parse_sender(text):
+        return (
+            "Saved mail does not store a separate recipient field, "
+            "so I can't filter by who a message was written to. "
+            "I can list mail you sent, or mail from a sender."
+        )
+    return None
+
+
+def apply_explicit_filters(question: str, plan: InboxQueryPlan, today: date) -> InboxQueryPlan:
+    """Overlay clear dates, counts, and mailbox direction. Does not invent senders."""
+    question = _fold_question(question)
+    plan.response_language = detect_response_language(question)
+    sender, _reason = parse_sender_query(question)
+    if sender:
+        plan.sender_contains = sender
+    elif rejected_from_phrase(question):
+        plan.sender_contains = None
+
+    if _looks_like_list(question) and plan.question_kind == "count":
+        plan.question_kind = "focused"
+
+    mailbox = parse_mailbox(question)
+    if mailbox:
+        plan.mailbox = mailbox
+    requested = _limit_from_question(question)
+    if requested:
+        plan.result_limit = requested
+    if plan.question_kind in {"count", "comparison"}:
+        return plan
+
+    if _OUTGOING_UNANSWERED_RE.search(question or ""):
+        plan.reply_need = "outgoing"
+        plan.question_kind = "focused"
+        plan.mailbox = "sent"
+        plan.rank_by = "recency"
+    elif _PENDING_REPLY_RE.search(question or ""):
+        plan.reply_need = "confirmed"
+        plan.question_kind = "focused"
+        plan.rank_by = None
+        plan.action_required = None
+    elif _DEADLINE_RE.search(question or "") and not is_briefing_question(question):
+        plan.deadline_only = True
+        plan.question_kind = "focused"
+    elif _NEWSLETTER_RE.search(question or ""):
+        plan.newsletter_only = True
+        plan.question_kind = "focused"
+        plan.rank_by = "recency"
+    elif _LATEST_RE.search(question or "") and not _asks_rank(question):
+        if SUMMARY_KIND_RE.search(question or "") or _CONVERSATION_RE.search(question or ""):
+            # "Summarize the latest …" is one answer, not an inbox dump.
+            plan.question_kind = "focused"
+            plan.rank_by = None
+            if plan.result_limit is None:
+                plan.result_limit = 1
+        else:
+            plan.rank_by = "recency"
+            plan.question_kind = "focused"
+    elif (
+        _asks_rank(question) or _MISSED_RE.search(question or "")
+    ) and not SUMMARY_KIND_RE.search(question or ""):
+        plan.rank_by = "importance"
+        plan.question_kind = "focused"
+        plan.importance = None
+        plan.action_required = None
+        if plan.result_limit is None and (
+            _asks_rank(question) or _MISSED_RE.search(question or "")
+        ):
+            plan.result_limit = 5
+
+    if _MISSED_RE.search(question or "") and not parse_date_windows(question, today=today):
+        start = today - timedelta(days=2)
+        plan.date_from_iso = start.isoformat()
+        plan.date_to_iso = today.isoformat()
+        plan.use_recent_fallback = False
+    return plan
+
+
+def _single_sender_summary(question: str) -> bool:
+    """Summarize one sender's latest email, rather than their whole history."""
+    if not SUMMARY_KIND_RE.search(question or ""):
+        return False
+    if _CONVERSATION_RE.search(question or "") or _CLIENT_RE.search(question or ""):
+        return False
+    return bool(parse_sender(question))
+
+
+def is_client_conversation_question(question: str) -> bool:
+    """A client thread summary, not a named-person question and not an inbox list."""
+    text = _fold_question(question or "")
+    if not _CLIENT_RE.search(text):
+        return False
+    return bool(
+        _CONVERSATION_RE.search(text)
+        or SUMMARY_KIND_RE.search(text)
+        or _LATEST_RE.search(text)
+    )
+
+
+_CLIENT_NAME_STOP = {
+    "a",
+    "an",
+    "the",
+    "my",
+    "our",
+    "in",
+    "on",
+    "for",
+    "hindi",
+    "english",
+    "client",
+    "customer",
+    "email",
+    "mail",
+    "conversation",
+    "latest",
+    "newest",
+}
+
+
+def _clean_client_name(raw: str | None) -> str | None:
+    parts = [part for part in (raw or "").split() if part]
+    kept: list[str] = []
+    for part in parts:
+        if part.lower() in _CLIENT_NAME_STOP:
+            break
+        kept.append(part)
+    if not kept:
+        return None
+    return " ".join(kept)
+
+
+def _client_name(question: str) -> str | None:
+    match = _CLIENT_NAME_RE.search(question or "")
+    if match:
+        return _clean_client_name(match.group(1))
+    if not _CLIENT_RE.search(question or ""):
+        return None
+    match = re.search(
+        r"\bwith\s+([A-Za-z][\w.'-]{2,}(?:\s+[A-Za-z][\w.'-]{2,})?)",
+        question or "",
+        re.I,
+    )
+    if not match:
+        return None
+    return _clean_client_name(match.group(1))
+
+
+def _automated_mail(email: dict) -> bool:
+    if _promo_mail(email, _analysis(email)):
+        return True
+    return bool(_NO_REPLY_SENDER_RE.search(str(email.get("sender") or "")))
+
+
+def _thread_key(email: dict) -> str:
+    return str(email.get("gmail_thread_id") or email.get("id") or "")
+
+
+def _has_sent(rows: list[dict]) -> bool:
+    for row in rows:
+        labels = [str(label).upper() for label in (row.get("label_ids") or [])]
+        if "SENT" in labels:
+            return True
+    return False
+
+
+def _client_clarification(
+    language: str,
+    *,
+    candidates: list[dict],
+    sent_missing: bool,
+    newsletters_only: bool,
+    name: str | None = None,
+) -> str:
+    if language == "hi":
+        if name and not candidates:
+            text = (
+                f"{name} के साथ कोई सहेजी बातचीत नहीं मिली. "
+                "मैं किसी भेजने वाले को ग्राहक नहीं मानता जब तक आप नाम न बताएं."
+            )
+        elif newsletters_only or not candidates:
+            text = (
+                "मेरे पास आपकी ग्राहक सूची नहीं है, इसलिए मैं अनुमान नहीं लगाऊँगा. "
+                "हाल के संदेश न्यूज़लेटर या अपने-आप भेजे मेल लगते हैं. "
+                "कृपया ग्राहक का नाम या ईमेल बताएं."
+            )
+        else:
+            text = (
+                "मेरे पास आपकी ग्राहक सूची नहीं है, इसलिए ये बातचीत ग्राहक के रूप में "
+                "पुष्टि नहीं हैं. नंबर या नाम बताएं:\n"
+            )
+            for index, email in enumerate(candidates, start=1):
+                text += (
+                    f"{index}. {email.get('subject') or 'Untitled'} — "
+                    f"{email.get('sender') or 'Unknown'} — {_when_text(email)}\n"
+                )
+            text = text.rstrip()
+        if sent_missing:
+            text += " भेजा गया मेल अधूरा हो सकता है, क्योंकि Sent सिंक आंशिक है."
+        return text
+    if language == "hinglish":
+        if name and not candidates:
+            text = (
+                f"{name} ke saath koi saved conversation nahi mili. "
+                "Main kisi sender ko client nahi maanata jab tak aap naam na batayein."
+            )
+        elif newsletters_only or not candidates:
+            text = (
+                "Mere paas aapki client list nahi hai, isliye main guess nahi karunga. "
+                "Recent mail newsletters ya automated lagti hai. "
+                "Client ka naam ya email batayein."
+            )
+        else:
+            text = (
+                "Mere paas aapki client list nahi hai, isliye yeh conversations "
+                "client ke roop mein unverified hain. Number ya naam batayein:\n"
+            )
+            for index, email in enumerate(candidates, start=1):
+                text += (
+                    f"{index}. {email.get('subject') or 'Untitled'} — "
+                    f"{email.get('sender') or 'Unknown'} — {_when_text(email)}\n"
+                )
+            text = text.rstrip()
+        if sent_missing:
+            text += " Sent mail incomplete ho sakti hai."
+        return text
+    if name and not candidates:
+        text = (
+            f"No stored conversation with {name}. "
+            "I won't treat a sender as a client unless you name them."
+        )
+    elif newsletters_only or not candidates:
+        text = (
+            "I don't have a saved client list, so I won't guess. "
+            "Recent stored mail looks like newsletters or automated notices. "
+            "Name the client or give an email address."
+        )
+    else:
+        lines = [
+            "I don't have a saved client list, so these conversations are unverified. "
+            "Reply with a number or the client's name:"
+        ]
+        for index, email in enumerate(candidates, start=1):
+            lines.append(
+                f"{index}. {email.get('subject') or 'Untitled'} — "
+                f"{email.get('sender') or 'Unknown'} — {_when_text(email)}"
+            )
+        text = "\n".join(lines)
+    if sent_missing:
+        text += (
+            " Outgoing messages may be missing because Sent synchronization is partial."
+        )
+    return text
+
+
+def _conversation_bullets(messages: list[dict], language: str, *, sent_missing: bool) -> str:
+    newest = max(messages, key=lambda row: int(row.get("internal_date") or 0))
+    analysis = _analysis(newest)
+    summary = str(analysis.get("summary") or newest.get("snippet") or newest.get("subject") or "").strip()
+    if not summary:
+        summary = "No discussion summary is stored for this thread."
+    exchanged = str(newest.get("snippet") or "").strip()
+    action = analysis.get("action_required") is True
+    if language == "hi":
+        if not exchanged or exchanged == summary:
+            exchanged = "केवल सहेजा विषय और सार उपलब्ध है."
+        pending = (
+            "इस थ्रेड पर जवाब या कार्रवाई सहेजी है."
+            if action
+            else "इस थ्रेड पर कोई लंबित कार्रवाई सहेजी नहीं है."
+        )
+        if sent_missing:
+            pending += " इस थ्रेड पर भेजा गया संदेश सहेजा नहीं है."
+    elif language == "hinglish":
+        if not exchanged or exchanged == summary:
+            exchanged = "Sirf saved subject aur summary available hai."
+        pending = (
+            "Is thread par reply ya action saved hai."
+            if action
+            else "Is thread par koi pending action saved nahi hai."
+        )
+        if sent_missing:
+            pending += " Is thread par sent message saved nahi hai."
+    else:
+        if not exchanged or exchanged == summary:
+            exchanged = "Only the stored subject and summary are available."
+        pending = (
+            "Stored analysis marks a reply or action on this thread."
+            if action
+            else "No pending action is stored on this thread."
+        )
+        if sent_missing:
+            pending += " No outgoing message is stored on this thread."
+    if language == "hi":
+        lines = [
+            f"- मुख्य बात: {summary}",
+            f"- आदान-प्रदान: {exchanged}",
+            f"- अगला कदम: {pending}",
+        ]
+    elif language == "hinglish":
+        lines = [
+            f"- Main baat: {summary}",
+            f"- Jo exchange hua: {exchanged}",
+            f"- Next step: {pending}",
+        ]
+    else:
+        lines = [
+            f"- Main discussion: {summary}",
+            f"- What was exchanged: {exchanged}",
+            f"- Pending: {pending}",
+        ]
+    return "\n".join(lines)
+
+
+def explicit_mail_plan(question: str) -> bool:
+    """True when dates, direction, and ranking are explicit enough to skip a planner call."""
+    question = _fold_question(question)
+    if not has_mailbox_intent(question):
+        return False
+    if is_briefing_question(question) or is_draft_reply_question(question):
+        return False
+    if _asks_unsupported(question):
+        return True
+    if re.search(r"\b(client|customer)\b", question or "", re.I) and not TOPIC_RE.search(
+        question or ""
+    ):
+        return False
+    return bool(
+        _asks_rank(question)
+        or _MISSED_RE.search(question or "")
+        or _PENDING_REPLY_RE.search(question or "")
+        or _OUTGOING_UNANSWERED_RE.search(question or "")
+        or _NEWSLETTER_RE.search(question or "")
+        or (_DEADLINE_RE.search(question or "") and parse_date_windows(question))
+        or (
+            parse_date_windows(question)
+            and parse_mailbox(question)
+            and not TOPIC_RE.search(question or "")
+        )
+        or (_looks_like_list(question) and parse_date_windows(question))
+    )
+
+
 def parse_date_windows(
     question: str,
     today: date | None = None,
 ) -> list[DateWindow]:
     """Parse explicit and relative dates in Asia/Kolkata local calendar days."""
     today = today or today_local()
-    text = question or ""
+    text = _fold_question(question or "")
     windows: list[DateWindow] = []
     seen: set[tuple[date, date]] = set()
     consumed: list[tuple[int, int]] = []
@@ -808,6 +1440,26 @@ def parse_date_windows(
         add(_last_month_window(today))
     if re.search(r"\bthis month\b", lowered):
         add(_this_month_window(today))
+
+    span = _relative_day_span(text, today)
+    if span:
+        add(span)
+    if re.search(r"(?:\baaj\b|आज)", text, re.I):
+        add(_window_for_day(today))
+    if re.search(r"(?:\bis hafte\b|\biss hafte\b|इस हफ्ते|इस सप्ताह)", text, re.I):
+        add(_this_week_window(today))
+    if re.search(r"(?:\bpichhle hafte\b|\bpichle hafte\b|पिछले हफ्ते)", text, re.I):
+        add(_last_week_window(today))
+    if re.search(r"(?:\bparso\b|\bparson\b|परसों)", text, re.I):
+        past = _past_mail_cue(text)
+        add(_window_for_day(today - timedelta(days=2) if past else today + timedelta(days=2)))
+    elif re.search(r"(?:\bkal\b|कल)", text, re.I):
+        future = re.search(r"\b(bhej|bhejo|bhejna|send|भेज)\b", text, re.I)
+        past = _past_mail_cue(text)
+        if future and not past:
+            add(_window_for_day(today + timedelta(days=1)))
+        else:
+            add(_window_for_day(today - timedelta(days=1)))
 
     for match in MONTH_SPAN_RE.finditer(text):
         month = MONTH_LOOKUP[match.group(1).lower()]
@@ -985,6 +1637,10 @@ def refine_plan(
             plan.date_from_iso = windows[0].date_from.isoformat()
             plan.date_to_iso = windows[0].date_to.isoformat()
         plan.use_recent_fallback = False
+    else:
+        # A model must not invent a calendar range the question never stated.
+        plan.date_from_iso = None
+        plan.date_to_iso = None
 
     sender, _reason = parse_sender_query(question)
     if sender:
@@ -1037,7 +1693,7 @@ def refine_plan(
         and not has_mailbox_intent(question)
     ):
         plan.question_kind = "general"
-    return plan
+    return apply_explicit_filters(question, plan, today or today_local())
 
 
 def _date_to_internal_ms_range(
@@ -1117,7 +1773,11 @@ def format_count_answer(payload: ChatRetrieval) -> str:
             parts.append(f"from {_pretty_date(start)} to {_pretty_date(end)}")
     elif start:
         parts.append(f"on {_pretty_date(start)}")
-    return " ".join(parts) + "."
+    text = " ".join(parts) + "."
+    if count == 0 and payload.freshness_note:
+        text += " " + payload.freshness_note
+        text += " That is not proof the mailbox has no matching mail."
+    return text
 
 
 def format_comparison_answer(payload: ChatRetrieval) -> str:
@@ -1542,6 +2202,423 @@ def _log_retrieval(
     )
 
 
+def _promo_mail(email: dict, analysis: dict) -> bool:
+    category = str(analysis.get("category") or "").lower()
+    if category in {"promotion", "promotions", "newsletter", "marketing", "social"}:
+        return True
+    labels = email.get("label_ids") or []
+    return any(
+        str(label).upper() in {"CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL"}
+        for label in labels
+    )
+
+
+def _when_text(email: dict) -> str:
+    raw = email.get("internal_date")
+    if isinstance(raw, (int, float)) and raw > 10_000_000_000:
+        stamp = datetime.fromtimestamp(raw / 1000, tz=_chat_tz())
+        return format_email_when(stamp)
+    return format_email_when(email.get("received_at"))
+
+
+def _dedupe_threads(emails: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    kept: list[dict] = []
+    ordered = sorted(
+        emails,
+        key=lambda row: int(row.get("internal_date") or 0),
+        reverse=True,
+    )
+    for email in ordered:
+        key = str(email.get("gmail_thread_id") or email.get("id") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        kept.append(email)
+    return kept
+
+
+def _later_incoming(email: dict, pool: list[dict]) -> bool:
+    thread = str(email.get("gmail_thread_id") or "")
+    if not thread:
+        return False
+    stamp = int(email.get("internal_date") or 0)
+    for other in pool:
+        if str(other.get("gmail_thread_id") or "") != thread:
+            continue
+        if int(other.get("internal_date") or 0) <= stamp:
+            continue
+        labels = [str(label).upper() for label in (other.get("label_ids") or [])]
+        if "SENT" in labels:
+            continue
+        return True
+    return False
+
+
+def _narrow_matches(
+    emails: list[dict],
+    plan: InboxQueryPlan,
+    today: date,
+) -> tuple[list[dict], dict]:
+    """Rank or classify a retrieved page. Does not call a model."""
+    original = list(emails or [])
+    rows = _dedupe_threads(original)
+    notes: dict[str, dict] = {}
+    mode = plan.reply_need
+    if mode == "confirmed":
+        from end_my_day_service import classify_reply_need
+
+        kept = []
+        for email in rows:
+            analysis = _analysis(email)
+            if classify_reply_need(email, analysis) != "confirmed_request":
+                continue
+            kept.append(email)
+            notes[str(email.get("id"))] = {
+                "importance": (analysis.get("importance") or None),
+                "reason": "The message asks you for something directly.",
+                "received_at": _when_text(email),
+                "gmail_message_id": email.get("gmail_message_id"),
+            }
+        return kept, notes
+
+    if mode == "outgoing":
+        from ai_followup_assistant import looks_like_outgoing_request
+
+        kept = []
+        for email in rows:
+            labels = [str(label).upper() for label in (email.get("label_ids") or [])]
+            if "SENT" not in labels:
+                continue
+            analysis = _analysis(email)
+            if not looks_like_outgoing_request(email, analysis):
+                continue
+            if _later_incoming(email, original):
+                continue
+            kept.append(email)
+            notes[str(email.get("id"))] = {
+                "reason": "You sent a request, and no later incoming reply is stored in this set.",
+                "received_at": _when_text(email),
+                "gmail_message_id": email.get("gmail_message_id"),
+            }
+        return kept, notes
+
+    if plan.deadline_only:
+        kept = []
+        for email in rows:
+            analysis = _analysis(email)
+            deadlines = analysis.get("deadlines") or []
+            texts = [str(item).strip() for item in deadlines if str(item).strip()]
+            if not texts:
+                continue
+            kept.append(email)
+            notes[str(email.get("id"))] = {
+                "importance": analysis.get("importance"),
+                "reason": "Stored deadline: " + "; ".join(texts[:3]),
+                "received_at": _when_text(email),
+                "gmail_message_id": email.get("gmail_message_id"),
+            }
+        return kept, notes
+
+    if plan.newsletter_only:
+        kept = [email for email in rows if _promo_mail(email, _analysis(email))]
+        for email in kept:
+            notes[str(email.get("id"))] = {
+                "reason": "Stored as a newsletter or promotion.",
+                "received_at": _when_text(email),
+                "gmail_message_id": email.get("gmail_message_id"),
+            }
+        return kept, notes
+
+    if plan.rank_by == "importance":
+        from briefing_priority import build_priority_reason, score_email_priority
+
+        scored: list[tuple[int, int, dict]] = []
+        for index, email in enumerate(rows):
+            analysis = _analysis(email)
+            if _promo_mail(email, analysis):
+                continue
+            try:
+                score = score_email_priority(email, briefing_day=today, analysis=analysis)
+            except Exception:
+                logger.exception("Priority score failed for %s", email.get("id"))
+                score = {"score": 0, "importance": None}
+            importance = score.get("importance")
+            if importance:
+                reason = build_priority_reason(score)
+            else:
+                reason = "No saved importance analysis; listed after emails that have one."
+            notes[str(email.get("id"))] = {
+                "importance": importance,
+                "reason": reason,
+                "received_at": _when_text(email),
+                "gmail_message_id": email.get("gmail_message_id"),
+            }
+            scored.append((int(score.get("score") or 0), -index, email))
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [item[2] for item in scored], notes
+
+    for email in rows:
+        analysis = _analysis(email)
+        notes[str(email.get("id"))] = {
+            "importance": analysis.get("importance"),
+            "received_at": _when_text(email),
+            "gmail_message_id": email.get("gmail_message_id"),
+        }
+    return rows, notes
+
+
+def freshness_note_from_state(state: dict | None) -> str | None:
+    """Warn when the sync checkpoint is old or historical backfill is unfinished."""
+    if not isinstance(state, dict) or not state:
+        return None
+    notes: list[str] = []
+    status = str(state.get("backfill_status") or "").strip().lower()
+    if status and status not in {"complete", "done"}:
+        notes.append("Historical mailbox backfill is still incomplete.")
+    updated = state.get("updated_at")
+    age = _sync_age_minutes(updated)
+    try:
+        threshold = int(os.getenv("GMAIL_SYNC_INTERVAL_MINUTES", "15") or 15)
+    except ValueError:
+        threshold = 15
+    if age is None:
+        notes.append("There is no sync checkpoint for this mailbox.")
+    elif age > max(threshold, 1):
+        notes.append(f"The last sync checkpoint is {int(age)} minutes old.")
+    if not notes:
+        return None
+    return " ".join(notes)
+
+
+def _sync_age_minutes(value) -> float | None:
+    if value is None or value == "":
+        return None
+    stamp: datetime | None = None
+    if isinstance(value, datetime):
+        stamp = value
+    elif isinstance(value, str):
+        try:
+            stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if stamp is None:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=_chat_tz())
+    delta = datetime.now(stamp.tzinfo) - stamp
+    return delta.total_seconds() / 60
+
+
+def _coverage_phrase(payload: ChatRetrieval) -> str:
+    bits = []
+    mailbox = payload.mailbox or "inbox"
+    if mailbox == "sent":
+        bits.append("Sent")
+    elif mailbox == "all":
+        bits.append("all stored mail")
+    else:
+        bits.append("Inbox")
+    if payload.sender_contains:
+        bits.append(f"from {payload.sender_contains}")
+    start = payload.date_from_iso
+    end = payload.date_to_iso
+    if start and end:
+        if start == end:
+            bits.append(f"on {_pretty_date(start)}")
+        else:
+            bits.append(f"from {_pretty_date(start)} to {_pretty_date(end)}")
+    elif start:
+        bits.append(f"on {_pretty_date(start)}")
+    if payload.unread_only:
+        bits.append("unread")
+    return " ".join(bits)
+
+
+def format_no_match(payload: ChatRetrieval) -> str:
+    language = payload.response_language or "en"
+    if payload.empty_reason:
+        text = payload.empty_reason
+        if payload.freshness_note:
+            text += " " + payload.freshness_note
+            text += " That is not proof the mailbox has no matching mail."
+        return text
+    coverage = _coverage_phrase(payload)
+    if language == "hi":
+        text = f"इन फ़िल्टर पर कोई सहेजा मेल नहीं मिला: {coverage}."
+    elif language == "hinglish":
+        text = f"In filters par koi saved mail nahi mila: {coverage}."
+    else:
+        text = f"No matching stored emails for {coverage}."
+    if payload.freshness_note:
+        text += " " + payload.freshness_note
+        text += " That is not proof the mailbox has no matching mail."
+    return text
+
+
+def format_direct_list(question: str, payload: ChatRetrieval) -> str:
+    language = payload.response_language or "en"
+    shown = payload.emails or []
+    count = len(shown)
+    requested = payload.requested_limit
+    coverage = _coverage_phrase(payload)
+    if language == "hi":
+        intro = f"{coverage} में से {count} ईमेल"
+    elif language == "hinglish":
+        intro = f"{coverage} mein se {count} emails"
+    else:
+        intro = f"{count} emails in {coverage}"
+    if requested and count < requested:
+        if language == "hi":
+            intro += f" ({requested} माँगे गए थे)"
+        elif language == "hinglish":
+            intro += f" ({requested} maange gaye the)"
+        else:
+            intro += f" ({requested} requested)"
+    elif payload.truncated and payload.match_count and payload.match_count > count:
+        intro += f", showing {count} of {payload.match_count}"
+    lines = [intro + "."]
+    for index, email in enumerate(shown, start=1):
+        note = (payload.rank_notes or {}).get(str(email.get("id"))) or {}
+        subject = email.get("subject") or "Untitled email"
+        sender = email.get("sender") or "Unknown sender"
+        when = note.get("received_at") or _when_text(email)
+        reason = note.get("reason") or ""
+        importance = note.get("importance") or ""
+        label = f"{importance} — " if importance else ""
+        line = f"{index}. {label}{subject} — {sender}"
+        if when:
+            line += f" — {when}"
+        lines.append(line)
+        if reason:
+            prefix = "कारण: " if language == "hi" else "Reason: "
+            lines.append(prefix + reason)
+    if payload.freshness_note:
+        lines.append(payload.freshness_note)
+    if not shown:
+        return format_no_match(payload)
+    return "\n".join(lines)
+
+
+def _human_threads(rows: list[dict]) -> list[list[dict]]:
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        if not isinstance(row, dict) or _automated_mail(row):
+            continue
+        key = _thread_key(row)
+        if not key:
+            continue
+        grouped.setdefault(key, []).append(row)
+    threads = list(grouped.values())
+    threads.sort(
+        key=lambda messages: max(int(message.get("internal_date") or 0) for message in messages),
+        reverse=True,
+    )
+    return threads
+
+
+def _retrieve_client_conversation(
+    question: str,
+    *,
+    gmail_account_email: str | None,
+    search_emails_for_chat,
+    sync_state: dict | None,
+) -> ChatRetrieval:
+    """Bounded client-thread lookup. Does not treat every sender as a client."""
+    language = detect_response_language(question)
+    name = _client_name(question)
+    try:
+        rows = search_emails_for_chat(
+            gmail_account_email=gmail_account_email,
+            sender_contains=name,
+            keywords=[],
+            importance=None,
+            action_required=None,
+            internal_date_from_ms=None,
+            internal_date_to_ms=None,
+            limit=_CLIENT_SCAN_LIMIT,
+            in_inbox_only=False,
+            unread_only=False,
+            label_contains=None,
+        )
+    except Exception:
+        logger.exception("Client conversation search failed")
+        return ChatRetrieval(
+            emails=[],
+            question_kind="focused",
+            needs_clarification=(
+                "I couldn't read stored mail just now. Try again in a moment."
+            ),
+            response_language=language,
+            freshness_note=freshness_note_from_state(sync_state),
+        )
+
+    rows = [row for row in (rows or []) if isinstance(row, dict)]
+    sent_missing = not _has_sent(rows)
+    threads = _human_threads(rows)
+    if name:
+        needle = name.lower()
+        threads = [
+            messages
+            for messages in threads
+            if any(needle in str(message.get("sender") or "").lower() for message in messages)
+        ]
+    newsletters_only = bool(rows) and not threads
+    if len(threads) == 1 and name:
+        messages = threads[0]
+        cited = max(messages, key=lambda row: int(row.get("internal_date") or 0))
+        return ChatRetrieval(
+            emails=[cited],
+            question_kind="focused",
+            match_count=1,
+            sender_contains=name,
+            rank_notes={
+                str(cited.get("id")): {
+                    "received_at": _when_text(cited),
+                    "gmail_message_id": cited.get("gmail_message_id"),
+                }
+            },
+            response_language=language,
+            prepared_answer=_conversation_bullets(
+                messages,
+                language,
+                sent_missing=not _has_sent(messages),
+            ),
+            freshness_note=freshness_note_from_state(sync_state),
+            direct_list=False,
+        )
+
+    candidates = [
+        max(messages, key=lambda row: int(row.get("internal_date") or 0))
+        for messages in threads[:3]
+    ]
+    notes = {
+        str(email.get("id")): {
+            "received_at": _when_text(email),
+            "gmail_message_id": email.get("gmail_message_id"),
+        }
+        for email in candidates
+        if email.get("id")
+    }
+    return ChatRetrieval(
+        emails=candidates,
+        rank_notes=notes,
+        question_kind="focused",
+        match_count=len(candidates),
+        sender_contains=name,
+        needs_clarification=_client_clarification(
+            language,
+            candidates=candidates,
+            sent_missing=sent_missing,
+            newsletters_only=newsletters_only,
+            name=name,
+        ),
+        response_language=language,
+        freshness_note=freshness_note_from_state(sync_state),
+        direct_list=False,
+    )
+
+
 def retrieve_emails_for_question(
     question: str,
     *,
@@ -1557,13 +2634,14 @@ def retrieve_emails_for_question(
     selected_contact_id: str | None = None,
     bound_contact_id: str | None = None,
     candidate_offset: int = 0,
+    sync_state: dict | None = None,
 ) -> ChatRetrieval:
     """Resolve email set for a chat turn (selected email or filtered search)."""
     today = today or today_local()
     heuristic = classify_question(question)
     picked = list_pick_index(question)
     if picked is not None:
-        sources = previous_list_sources(history)
+        sources = previous_list_sources(history, prefer_list=True)
         if picked < 1 or picked > len(sources):
             count = len(sources)
             message = (
@@ -1575,14 +2653,17 @@ def retrieve_emails_for_question(
                 emails=[],
                 question_kind="focused",
                 needs_clarification=message,
+                response_language=detect_response_language(question),
             )
         chosen = sources[picked - 1]
         row = get_stored_email(chosen.get("email_id")) if chosen.get("email_id") else None
         emails = [row] if row else []
+        kind = "draft_reply" if is_draft_reply_question(question) else "focused"
         return ChatRetrieval(
             emails=emails,
-            question_kind="focused",
+            question_kind=kind,
             match_count=len(emails),
+            response_language=detect_response_language(question),
             needs_clarification=(
                 None
                 if emails
@@ -1603,6 +2684,48 @@ def retrieve_emails_for_question(
         )
         _log_retrieval(payload, count_sql=False)
         return payload
+
+    named_draft_target = re.search(
+        r"\bdraft a reply to\s+(?!it\b|that\b|this\b)[A-Za-z]",
+        question or "",
+        re.I,
+    )
+    refers_to_prior = (
+        bool(_PRIOR_EMAIL_RE.search(question or ""))
+        and not sender_hint
+        and not named_draft_target
+    )
+    if refers_to_prior and not this_email:
+        prior_sources = previous_list_sources(history, prefer_list=False)
+        if len(prior_sources) == 1:
+            chosen = prior_sources[0]
+            row = get_stored_email(chosen.get("email_id")) if chosen.get("email_id") else None
+            emails = [row] if row else []
+            return ChatRetrieval(
+                emails=emails,
+                question_kind="draft_reply" if draft_reply else "focused",
+                match_count=len(emails),
+                response_language=detect_response_language(question),
+                needs_clarification=None if emails else "That email is no longer in the stored inbox.",
+            )
+        if len(prior_sources) > 1:
+            return ChatRetrieval(
+                emails=[],
+                question_kind="focused",
+                response_language=detect_response_language(question),
+                needs_clarification=(
+                    "Which email do you mean? Say the number, for example the second one."
+                ),
+            )
+        if not (draft_reply and email_id):
+            return ChatRetrieval(
+                emails=[],
+                question_kind="draft_reply" if draft_reply else "focused",
+                response_language=detect_response_language(question),
+                needs_clarification=(
+                    "Which email do you mean? Open one, or ask for a list first."
+                ),
+            )
 
     # Selected email: "this email", draft-reply without another sender, or
     # single-email summarize of the open message.
@@ -1660,7 +2783,16 @@ def retrieve_emails_for_question(
                 today=today,
                 history=None,
                 _followup_resolved=True,
+                sync_state=sync_state,
             )
+
+    if is_client_conversation_question(question) and not draft_reply and not briefing_q:
+        return _retrieve_client_conversation(
+            question,
+            gmail_account_email=gmail_account_email,
+            search_emails_for_chat=search_emails_for_chat,
+            sync_state=sync_state,
+        )
 
     if (
         heuristic not in {"count", "comparison", "briefing", "draft_reply"}
@@ -1675,9 +2807,14 @@ def retrieve_emails_for_question(
         )
 
         person_turn = (
-            bool(selected_contact_id)
-            or is_person_question(question)
-            or is_pronoun_person_followup(question)
+            not explicit_mail_plan(question)
+            and not rejected_from_phrase(question)
+            and not _single_sender_summary(question)
+            and (
+                bool(selected_contact_id)
+                or is_person_question(question)
+                or is_pronoun_person_followup(question)
+            )
         )
         if ask_about_person_enabled() and person_turn:
             from person_context import retrieve_person_context
@@ -1713,6 +2850,16 @@ def retrieve_emails_for_question(
             _log_retrieval(payload, count_sql=False)
             return payload
 
+    unsupported = _asks_unsupported(question)
+    if unsupported and heuristic not in {"count", "comparison"}:
+        return ChatRetrieval(
+            emails=[],
+            question_kind="focused",
+            needs_clarification=unsupported,
+            response_language=detect_response_language(question),
+            freshness_note=freshness_note_from_state(sync_state),
+        )
+
     if heuristic in {"count", "comparison"}:
         plan = refine_plan(
             question, InboxQueryPlan(question_kind=heuristic), today=today
@@ -1720,6 +2867,10 @@ def retrieve_emails_for_question(
     elif heuristic == "general":
         plan = refine_plan(
             question, InboxQueryPlan(question_kind="general"), today=today
+        )
+    elif explicit_mail_plan(question):
+        plan = refine_plan(
+            question, InboxQueryPlan(question_kind="focused"), today=today
         )
     else:
         plan = refine_plan(question, plan_inbox_query(question), today=today)
@@ -1793,6 +2944,11 @@ def retrieve_emails_for_question(
             "professional",
         }
         keywords = [k for k in keywords if k.lower() not in draft_noise]
+    mailbox = plan.mailbox or "inbox"
+    if plan.rank_by == "importance":
+        # Ranking uses saved analysis. Do not also require importance=high.
+        plan.importance = None
+        plan.action_required = None
     search_kwargs = {
         "gmail_account_email": gmail_account_email,
         "sender_contains": plan.sender_contains,
@@ -1802,7 +2958,8 @@ def retrieve_emails_for_question(
         "internal_date_from_ms": start_ms,
         "internal_date_to_ms": end_ms,
         "unread_only": bool(plan.unread_only),
-        "in_inbox_only": True,
+        "in_inbox_only": mailbox == "inbox",
+        "label_contains": "SENT" if mailbox == "sent" else None,
     }
 
     if kind in {"count", "comparison"}:
@@ -1870,22 +3027,60 @@ def retrieve_emails_for_question(
             sender_contains=plan.sender_contains,
             unread_only=bool(plan.unread_only),
             keywords=keywords,
+            mailbox=mailbox,
+            response_language=plan.response_language or "en",
+            freshness_note=freshness_note_from_state(sync_state) if match_count == 0 else None,
         )
         _log_retrieval(payload, count_sql=True, from_ms=start_ms, to_ms=end_ms)
         return payload
 
-    emails = search_emails_for_chat(**search_kwargs, limit=limit)
-    match_count = len(emails)
-    truncated = False
-    counter = count_emails_for_chat
-    if counter is None:
-        from db import count_emails_for_chat as counter
+    special = bool(
+        plan.rank_by or plan.reply_need or plan.deadline_only or plan.newsletter_only
+    )
+    list_request = _looks_like_list(question) and kind == "focused"
+    if special:
+        fetch_limit = max(plan.result_limit or 5, 80)
+    elif plan.result_limit:
+        fetch_limit = plan.result_limit
+    else:
+        fetch_limit = limit
     try:
-        match_count = int(counter(**search_kwargs) or len(emails))
+        emails = search_emails_for_chat(**search_kwargs, limit=fetch_limit)
     except Exception:
-        logger.exception("Chat COUNT failed; using retrieved length")
+        logger.exception("Chat search failed")
+        return ChatRetrieval(
+            emails=[],
+            question_kind=kind,
+            needs_clarification=(
+                "I couldn't read stored mail just now. Try again in a moment."
+            ),
+            date_from_iso=plan.date_from_iso,
+            date_to_iso=plan.date_to_iso,
+            mailbox=mailbox,
+            response_language=plan.response_language or "en",
+            freshness_note=freshness_note_from_state(sync_state),
+        )
+    notes: dict = {}
+    if special or list_request:
+        emails, notes = _narrow_matches(emails, plan, today)
+        shown_limit = plan.result_limit or (5 if plan.rank_by == "importance" else limit)
         match_count = len(emails)
-    truncated = match_count > len(emails)
+        truncated = match_count > shown_limit
+        emails = emails[:shown_limit]
+    else:
+        if plan.result_limit and SUMMARY_KIND_RE.search(question or ""):
+            emails = emails[: plan.result_limit]
+        match_count = len(emails)
+        truncated = False
+        counter = count_emails_for_chat
+        if counter is None:
+            from db import count_emails_for_chat as counter
+        try:
+            match_count = int(counter(**search_kwargs) or len(emails))
+        except Exception:
+            logger.exception("Chat COUNT failed; using retrieved length")
+            match_count = len(emails)
+        truncated = match_count > len(emails)
 
     clarify = None
     result_emails = emails
@@ -1918,6 +3113,24 @@ def retrieve_emails_for_question(
         unread_only=bool(plan.unread_only),
         keywords=keywords,
         needs_clarification=clarify,
+        rank_notes=notes,
+        freshness_note=freshness_note_from_state(sync_state),
+        response_language=plan.response_language or "en",
+        direct_list=bool(
+            (special or list_request or explicit_mail_plan(question))
+            and kind == "focused"
+            and not SUMMARY_KIND_RE.search(question or "")
+            and not is_client_conversation_question(question)
+        ),
+        mailbox=mailbox,
+        requested_limit=plan.result_limit,
+        empty_reason=(
+            "No stored emails are a direct request for your reply."
+            if plan.reply_need == "confirmed" and not result_emails
+            else "No stored outgoing requests are still waiting for a reply."
+            if plan.reply_need == "outgoing" and not result_emails
+            else None
+        ),
     )
     _log_retrieval(
         payload,
@@ -1934,6 +3147,7 @@ def answer_email_question(
     *,
     history: list[ChatHistoryTurn] | list[dict] | None = None,
     coverage_note: str | None = None,
+    response_language: str = "en",
 ) -> str:
     context = build_email_context(emails)
     extra = f"{coverage_note}\n\n" if coverage_note else ""
@@ -1994,7 +3208,17 @@ def answer_email_question(
                 "This store is Inbox-only and does not include Sent copies. "
                 "If asked whether an email was replied to, say you cannot confirm "
                 "reply status from stored Inbox data. "
-                "Skip filler openers like 'Certainly' or 'I'd be happy to help'."
+                "Skip filler openers like 'Certainly' or 'I'd be happy to help'. "
+                + (
+                    "Reply in Hindi. Keep names, email addresses, dates, "
+                    "legal terms, and quoted facts as they appear in the source. "
+                    if response_language == "hi"
+                    else "Reply in Hinglish (Roman Hindi mixed with English). "
+                    "Keep names, email addresses, dates, legal terms, and quoted facts unchanged. "
+                    if response_language == "hinglish"
+                    else "Reply in English. "
+                    "Keep names, email addresses, and quoted facts unchanged."
+                )
             )
         ),
         HumanMessage(
@@ -2054,6 +3278,18 @@ def answer_general_question(
     return str(response.content)
 
 
+def _ensure_email_bodies(emails: list[dict]) -> None:
+    """Load bodies only for the messages that will be quoted or drafted."""
+    if not emails or all("body" in email for email in emails):
+        return
+    try:
+        from db import hydrate_email_bodies
+
+        hydrate_email_bodies(emails)
+    except Exception:
+        logger.exception("Could not load email bodies for the answer")
+
+
 def run_chat(
     *,
     question: str,
@@ -2070,8 +3306,16 @@ def run_chat(
     if payload.needs_clarification:
         return {
             "answer": payload.needs_clarification,
-            "sources": emails_to_sources(payload.emails) if payload.emails else [],
+            "sources": emails_to_sources(payload.emails, payload.rank_notes) if payload.emails else [],
             "draft": None,
+        }
+
+    if payload.prepared_answer:
+        return {
+            "answer": payload.prepared_answer,
+            "sources": emails_to_sources(payload.emails, payload.rank_notes) if payload.emails else [],
+            "draft": None,
+            "freshness_note": payload.freshness_note,
         }
 
     if kind == "general":
@@ -2117,10 +3361,21 @@ def run_chat(
 
     if not payload.emails:
         return {
-            "answer": "No matching stored Inbox emails for that query.",
+            "answer": format_no_match(payload),
             "sources": [],
             "draft": None,
+            "freshness_note": payload.freshness_note,
         }
+
+    if payload.direct_list and kind == "focused":
+        return {
+            "answer": format_direct_list(question, payload),
+            "sources": emails_to_sources(payload.emails, payload.rank_notes),
+            "draft": None,
+            "freshness_note": payload.freshness_note,
+        }
+
+    _ensure_email_bodies(payload.emails)
 
     if kind == "draft_reply":
         return _run_draft_reply(
@@ -2147,11 +3402,15 @@ def run_chat(
         payload.emails,
         history=history,
         coverage_note=coverage_note,
+        response_language=payload.response_language or "en",
     )
+    if payload.freshness_note and payload.freshness_note not in answer:
+        answer = answer + "\n" + payload.freshness_note
     return {
         "answer": answer,
         "sources": select_chat_sources(question, payload.emails, kind),
         "draft": None,
+        "freshness_note": payload.freshness_note,
     }
 
 

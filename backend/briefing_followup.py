@@ -434,6 +434,7 @@ def _load_thread_messages(
                 return db_list_thread_messages(
                     gmail_account_email=gmail_account_email,
                     thread_id=thread_id,
+                    include_body=False,
                 )
         except Exception:
             loader = None
@@ -461,7 +462,38 @@ def _load_thread_messages(
                 "Thread load failed thread_id=%s; using seed messages only",
                 thread_id,
             )
+    _hydrate_reply_bodies(messages)
     return messages
+
+
+def _rows_needing_reply_body(messages: list[dict]) -> list[dict]:
+    """Bodies are loaded only when snippet and summary do not already decide."""
+    from briefing_structure import _analysis
+
+    needed: list[dict] = []
+    for row in messages:
+        if not isinstance(row, dict) or "body" in row:
+            continue
+        analysis = _analysis(row) or {}
+        blob = " ".join(str(row.get(key) or "") for key in ("subject", "snippet"))
+        summary = str(analysis.get("summary") or "")
+        if QUESTION_RE.search(blob) or QUESTION_RE.search(summary):
+            continue
+        if analysis.get("action_required") is True:
+            needed.append(row)
+    return needed
+
+
+def _hydrate_reply_bodies(messages: list[dict]) -> None:
+    needed = _rows_needing_reply_body(messages)
+    if not needed:
+        return
+    try:
+        from db import hydrate_email_bodies
+
+        hydrate_email_bodies(needed)
+    except Exception:
+        logger.exception("Could not load reply bodies; using snippet and summary")
 
 
 def _build_followup_item(
@@ -697,6 +729,21 @@ def detect_followups_for_account_sync(
 
     account_key = (gmail_account_email or account).strip()
     cleared_threads = _sent_draft_thread_ids(account_key) if account_key else set()
+    if list_thread_messages is None and account_key:
+        try:
+            from db import list_followup_threads
+
+            preloaded = list_followup_threads(
+                gmail_account_email=account_key,
+                thread_ids=list(thread_map),
+            )
+
+            def list_thread_messages(*, gmail_account_email: str, thread_id: str):
+                if gmail_account_email != account_key:
+                    return []
+                return list(preloaded.get(thread_id) or [])
+        except Exception:
+            logger.exception("Follow-up thread preload failed; loading per thread")
 
     results: list[dict[str, Any]] = []
     uncertain: list[dict[str, Any]] = []

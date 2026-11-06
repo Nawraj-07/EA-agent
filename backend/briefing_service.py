@@ -259,6 +259,16 @@ def _analysis_from_email(email: dict) -> dict:
 
 
 def _build_context(emails: list[dict], zone: ZoneInfo | None = None) -> str:
+    from db import hydrate_email_bodies
+
+    eventish = [
+        email for email in emails if looks_eventish(email) and "body" not in email
+    ]
+    if eventish:
+        try:
+            hydrate_email_bodies(eventish)
+        except Exception:
+            logger.exception("Briefing body hydrate failed; continuing with summaries")
     parts: list[str] = []
     for index, email in enumerate(emails, start=1):
         analysis = _analysis_from_email(email)

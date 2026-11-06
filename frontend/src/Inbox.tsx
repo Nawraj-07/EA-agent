@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import "./Inbox.css";
 import ChatPanel from "./ChatPanel";
 import DraftPanel from "./DraftPanel";
@@ -98,6 +98,7 @@ export default function Inbox() {
   const [error, setError] = useState("");
   const [detailError, setDetailError] = useState("");
   const [lastRefreshedAt, setLastRefreshedAt] = useState<Date | null>(null);
+  const inboxRevision = useRef<string | null>(null);
   const { visibleRange, rangeReady } = useBriefingVisibleRange();
 
   const dateFrom = visibleRange?.startDate ?? null;
@@ -196,11 +197,30 @@ export default function Inbox() {
   }, [category, rangeReady, dateFrom, dateTo, loadConversations]);
 
   useEffect(() => {
-    const timer = window.setInterval(() => {
+    const tick = async () => {
+      if (document.visibilityState === "hidden") return;
+      try {
+        const response = await fetch(`${API}/db/inbox/revision`);
+        if (response.ok) {
+          const data = await response.json();
+          const stamp = String(data?.updated_at || "");
+          if (stamp && stamp === inboxRevision.current) return;
+          if (stamp) inboxRevision.current = stamp;
+        }
+      } catch {
+        // Fall through and reload the list.
+      }
       void loadConversations({ silent: true });
-    }, AUTO_REFRESH_MS);
-
-    return () => window.clearInterval(timer);
+    };
+    const timer = window.setInterval(tick, AUTO_REFRESH_MS);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") tick();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, [loadConversations]);
 
   async function refreshInbox() {

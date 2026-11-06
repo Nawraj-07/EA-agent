@@ -166,7 +166,8 @@ def test_upsert_idempotent_conflict_key():
             return self
 
         def select(self, *_a, **_k):
-            self._mode = "select"
+            if self._mode != "upsert":
+                self._mode = "select"
             return self
 
         def eq(self, *_a, **_k):

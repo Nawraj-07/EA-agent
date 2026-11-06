@@ -231,7 +231,9 @@ def ingest_newest_inbox(
             len(ids),
             account,
         )
-        _ingest_message_ids(credentials, account, ids, stats)
+        _ingest_message_ids(
+            credentials, account, ids, stats, skip_existing=True
+        )
         page_token = page.get("next_page_token")
         if not page_token:
             break
@@ -277,7 +279,9 @@ def ingest_inbox_for_local_day(
         )
         if not ids:
             break
-        _ingest_message_ids(credentials, account, ids, stats)
+        _ingest_message_ids(
+            credentials, account, ids, stats, skip_existing=True
+        )
         page_token = page.get("next_page_token")
         if not page_token:
             break
@@ -314,7 +318,9 @@ def ingest_recent_inbox(
         )
         if not ids:
             break
-        _ingest_message_ids(credentials, account, ids, stats)
+        _ingest_message_ids(
+            credentials, account, ids, stats, skip_existing=True
+        )
         page_token = page.get("next_page_token")
         if not page_token:
             break
@@ -367,6 +373,48 @@ def reconcile_missing_inbox(
 
 
 def _ingest_message_ids(
+    credentials: Any,
+    account: str,
+    message_ids: list[str],
+    stats: dict[str, Any],
+    *,
+    skip_existing: bool = False,
+) -> None:
+    """
+    Fetch and upsert Gmail messages.
+
+    skip_existing is for the newest, recent, unread, and backfill passes.
+    Those passes list mail that is already stored. History additions and
+    label touches still upsert so label changes are applied.
+    """
+    from egress_meter import using_operation
+
+    ids = [mid for mid in message_ids if mid]
+    if skip_existing and ids:
+        try:
+            with using_operation("gmail_existing_ids"):
+                present = existing_gmail_message_ids(
+                    ids, gmail_account_email=account
+                )
+        except Exception:
+            logger.exception(
+                "Could not check stored Gmail ids; ingesting the listed page"
+            )
+            present = set()
+        fresh: list[str] = []
+        for mid in ids:
+            if mid in present:
+                stats["checked"] = stats.get("checked", 0) + 1
+                stats["skipped"] = stats.get("skipped", 0) + 1
+            else:
+                fresh.append(mid)
+        ids = fresh
+
+    with using_operation("gmail_upsert"):
+        _upsert_listed_messages(credentials, account, ids, stats)
+
+
+def _upsert_listed_messages(
     credentials: Any,
     account: str,
     message_ids: list[str],
@@ -445,7 +493,9 @@ def _run_backfill(
             len(ids),
             account,
         )
-        _ingest_message_ids(credentials, account, ids, stats)
+        _ingest_message_ids(
+            credentials, account, ids, stats, skip_existing=True
+        )
 
         page_token = page.get("next_page_token")
         if not page_token:
@@ -550,42 +600,48 @@ def analyze_pending_emails(
     if cap <= 0:
         return stats
 
-    rows = list_pending_analysis_emails(
-        gmail_account_email=gmail_account_email,
-        limit=cap,
-        statuses=statuses,
-    )
-    for row in rows:
-        try:
-            analysis = analyze_email_content(
-                subject=row.get("subject") or "",
-                sender=row.get("sender") or "",
-                body=row.get("body") or "",
-            )
-            analysis_data = analysis.model_dump()
-            save_analysis_for_email(row["id"], analysis_data)
-            stats["analyzed"] += 1
-            try:
-                if str(analysis_data.get("importance") or "").lower() == "high":
-                    from whatsapp_notifications import notify_whatsapp_important_email
+    from egress_meter import using_operation
 
-                    notify_whatsapp_important_email(row, analysis_data)
+    with using_operation("analysis_queue"):
+        rows = list_pending_analysis_emails(
+            gmail_account_email=gmail_account_email,
+            limit=cap,
+            statuses=statuses,
+        )
+        for row in rows:
+            try:
+                analysis = analyze_email_content(
+                    subject=row.get("subject") or "",
+                    sender=row.get("sender") or "",
+                    body=row.get("body") or "",
+                )
+                analysis_data = analysis.model_dump()
+                save_analysis_for_email(row["id"], analysis_data)
+                stats["analyzed"] += 1
+                try:
+                    if str(analysis_data.get("importance") or "").lower() == "high":
+                        from whatsapp_notifications import notify_whatsapp_important_email
+
+                        notify_whatsapp_important_email(row, analysis_data)
+                except Exception:
+                    logger.exception(
+                        "WhatsApp important-email notify failed email_id=%s "
+                        "(analysis remains saved)",
+                        row.get("id"),
+                    )
             except Exception:
+                stats["failed"] += 1
+                try:
+                    mark_analysis_failed(row["id"])
+                except Exception:
+                    logger.exception(
+                        "Failed to mark analysis_status=failed id=%s",
+                        row.get("id"),
+                    )
                 logger.exception(
-                    "WhatsApp important-email notify failed email_id=%s "
-                    "(analysis remains saved)",
+                    "AI analysis failed email_id=%s (inbox row kept)",
                     row.get("id"),
                 )
-        except Exception:
-            stats["failed"] += 1
-            try:
-                mark_analysis_failed(row["id"])
-            except Exception:
-                logger.exception("Failed to mark analysis_status=failed id=%s", row.get("id"))
-            logger.exception(
-                "AI analysis failed email_id=%s (inbox row kept)",
-                row.get("id"),
-            )
     return stats
 
 
@@ -599,9 +655,12 @@ def _is_auth_failure(exc: BaseException) -> bool:
 
 def run_analysis_queue() -> dict[str, int]:
     """Drain pending summaries for stored mail. Does not touch Gmail."""
+    from egress_meter import record_job
     from fastapi import HTTPException
     from gmail_oauth import STATUS_RECONNECT_REQUIRED, get_gmail_auth_snapshot
     from main import load_gmail_credentials
+
+    record_job("gmail_analysis_queue")
 
     empty = {"analyzed": 0, "failed": 0, "skipped": 0}
     snap = get_gmail_auth_snapshot()
@@ -638,8 +697,10 @@ def sync_gmail_inbox() -> dict[str, Any]:
 
     Safe when Gmail auth is missing/expired: logs and returns without raising.
     """
+    from egress_meter import record_job
     from gmail_oauth import set_gmail_syncing
 
+    record_job("gmail_inbox_sync")
     set_gmail_syncing(True)
     try:
         return _sync_gmail_inbox_impl()
@@ -821,21 +882,25 @@ def _sync_gmail_inbox_impl() -> dict[str, Any]:
             "Follow-up refresh after sync failed; Gmail sync results preserved"
         )
 
+    from egress_meter import instance_id
+
     logger.info(
         "Gmail sync finished account=%s mode=%s status=%s checked=%s saved=%s "
-        "failed=%s archived=%s analyzed=%s analyze_failed=%s "
-        "reconcile_scanned=%s reconcile_missing=%s",
+        "skipped=%s failed=%s archived=%s analyzed=%s analyze_failed=%s "
+        "reconcile_scanned=%s reconcile_missing=%s instance=%s",
         account,
         stats["mode"],
         stats["status"],
         stats["checked"],
         stats["saved"],
+        stats.get("skipped", 0),
         stats["failed"],
         stats["archived"],
         stats["analyzed"],
         stats["analyze_failed"],
         stats.get("reconcile_scanned", 0),
         stats.get("reconcile_missing", 0),
+        instance_id(),
     )
     return stats
 
@@ -864,6 +929,9 @@ def _briefing_minute_utc() -> int:
 
 def run_daily_briefing_job(target_date=None) -> dict:
     from briefing_service import run_daily_briefing
+    from egress_meter import record_job
+
+    record_job("daily_email_briefing")
 
     logger.info("Daily briefing job started target_date=%s", target_date)
     try:
@@ -1180,9 +1248,12 @@ def start_scheduler() -> None:
     _register_personalized_briefing_jobs(_scheduler)
 
     _scheduler.start()
+    from egress_meter import instance_id
+
     logger.info(
-        "Scheduler started: gmail_sync every %s min; "
+        "Scheduler started instance=%s gmail_sync every %s min; "
         "analysis queue every %s min; daily_briefing at %02d:%02d UTC",
+        instance_id(),
         interval,
         analyze_interval,
         briefing_hour,

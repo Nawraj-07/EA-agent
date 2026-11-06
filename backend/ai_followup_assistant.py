@@ -491,25 +491,28 @@ def refresh_followups_after_sync(account_email: str) -> dict[str, Any]:
         return result
     try:
         from briefing_followup import detect_followups_for_account_sync
-        from db import get_supabase_client
+        from db import EMAIL_LIST_WITH_ANALYSIS, get_supabase_client
+        from egress_meter import using_operation
 
-        # Recent stored mail only — no LLM
+        # Recent metadata only. Reply detection loads a thread body when it
+        # classifies that thread, so this scan does not pull 80 full bodies.
         client = get_supabase_client()
-        response = (
-            client.table("emails")
-            .select("*, email_analyses(*)")
-            .eq("gmail_account_email", account_email)
-            .order("internal_date", desc=True)
-            .limit(80)
-            .execute()
-        )
-        emails = response.data or []
-        result["processed"] = len(emails)
-        detected = detect_followups_for_account_sync(
-            emails,
-            account_email=account_email,
-            gmail_account_email=account_email,
-        )
+        with using_operation("followup_refresh"):
+            response = (
+                client.table("emails")
+                .select(EMAIL_LIST_WITH_ANALYSIS)
+                .eq("gmail_account_email", account_email)
+                .order("internal_date", desc=True)
+                .limit(80)
+                .execute()
+            )
+            emails = response.data or []
+            result["processed"] = len(emails)
+            detected = detect_followups_for_account_sync(
+                emails,
+                account_email=account_email,
+                gmail_account_email=account_email,
+            )
         active = detected.get("active") or []
         resolved_keys = detected.get("resolved_keys") or []
         sync_stats = sync_followup_recommendation_states(

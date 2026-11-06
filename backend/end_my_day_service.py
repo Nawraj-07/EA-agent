@@ -819,6 +819,7 @@ def build_review(
             start_ms=window["start_ms"],
             end_ms=window["end_ms"],
             limit=200,
+            include_body=True,
         )
         or []
     )
